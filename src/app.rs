@@ -48,6 +48,8 @@ pub struct FreetasiaApp {
     /// Clip being dragged on the timeline (id + offset from clip start to grab point).
     dragging_clip_id: Option<u64>,
     drag_offset: f64,
+    /// Whether the playhead handle is being dragged.
+    dragging_playhead: bool,
 
     // ── Dialogs / overlays ──
     show_export_dialog: bool,
@@ -72,6 +74,7 @@ impl FreetasiaApp {
             zoom: 80.0,
             dragging_clip_id: None,
             drag_offset: 0.0,
+            dragging_playhead: false,
             show_export_dialog: false,
             export_path: String::new(),
             show_about: false,
@@ -632,6 +635,7 @@ impl FreetasiaApp {
 
                 // ── Playhead ─────────────────────────────────────────────
                 let ph_x = origin.x + self.project.timeline.playhead as f32 * self.zoom;
+                // Line.
                 painter.line_segment(
                     [
                         Pos2::new(ph_x, origin.y),
@@ -639,47 +643,150 @@ impl FreetasiaApp {
                     ],
                     Stroke::new(2.0, COLOR_PLAYHEAD),
                 );
+                // Handle (downward-pointing triangle at the top of the ruler).
+                let handle_size = 8.0_f32;
+                let handle_top = origin.y;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(ph_x - handle_size, handle_top),
+                        Pos2::new(ph_x + handle_size, handle_top),
+                        Pos2::new(ph_x, handle_top + handle_size * 1.4),
+                    ],
+                    COLOR_PLAYHEAD,
+                    Stroke::NONE,
+                ));
 
                 // ── Mouse interaction ────────────────────────────────────
+                let playhead_not_playing = self.player.state() != PlaybackState::Playing;
+                let snap_threshold = 0.3_f64; // seconds
 
-                // Detect drag start on a clip.
+                // Detect drag start: playhead handle, clip, or empty.
                 if resp.drag_started() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
-                        let py = pos.y - (origin.y + ruler_h);
-                        if py >= 0.0 && py <= track_h {
-                            // Check if pointer is over a clip.
-                            if let Some(clip) = self
-                                .project
-                                .timeline
-                                .clips()
-                                .iter()
-                                .find(|c| t >= c.timeline_start && t <= c.timeline_end())
-                            {
-                                self.dragging_clip_id = Some(clip.id);
-                                self.drag_offset = t - clip.timeline_start;
-                                self.selected_clip_id = Some(clip.id);
+                        let py = pos.y - origin.y;
+
+                        // Check playhead handle first (generous hit area).
+                        let ph_hit_half = (handle_size + 4.0) / self.zoom;
+                        if py < ruler_h + 4.0
+                            && (t - self.project.timeline.playhead).abs() < ph_hit_half as f64
+                        {
+                            self.dragging_playhead = true;
+                        } else {
+                            let clip_py = pos.y - (origin.y + ruler_h);
+                            if clip_py >= 0.0 && clip_py <= track_h {
+                                if let Some(clip) = self
+                                    .project
+                                    .timeline
+                                    .clips()
+                                    .iter()
+                                    .find(|c| t >= c.timeline_start && t <= c.timeline_end())
+                                {
+                                    self.dragging_clip_id = Some(clip.id);
+                                    self.drag_offset = t - clip.timeline_start;
+                                    self.selected_clip_id = Some(clip.id);
+                                }
                             }
                         }
                     }
                 }
 
-                // While dragging a clip, move it.
-                if resp.dragged() && self.dragging_clip_id.is_some() {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let t = ((pos.x - origin.x) / self.zoom) as f64;
-                        let new_start = (t - self.drag_offset).max(0.0);
-                        let drag_id = self.dragging_clip_id.unwrap();
-                        if let Some(clip) = self.project.timeline.clip_mut(drag_id) {
-                            clip.timeline_start = new_start;
-                        }
-                    }
-                } else if resp.dragged() {
-                    // Not dragging a clip → scrub the playhead.
+                // Dragging the playhead handle.
+                if resp.dragged() && self.dragging_playhead {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         self.project.timeline.set_playhead(t);
-                        if self.player.state() == PlaybackState::Stopped {
+                        if playhead_not_playing {
+                            self.request_scrub_frame();
+                        }
+                    }
+                // Dragging a clip: snap + no-overlap.
+                } else if resp.dragged() && self.dragging_clip_id.is_some() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        let mut new_start = (t - self.drag_offset).max(0.0);
+                        let drag_id = self.dragging_clip_id.unwrap();
+
+                        // Get this clip's duration for overlap computation.
+                        let clip_dur = self
+                            .project
+                            .timeline
+                            .clips()
+                            .iter()
+                            .find(|c| c.id == drag_id)
+                            .map(|c| c.duration())
+                            .unwrap_or(0.0);
+                        let new_end = new_start + clip_dur;
+
+                        // Collect edges of other clips for snapping.
+                        let other_edges: Vec<(f64, f64)> = self
+                            .project
+                            .timeline
+                            .clips()
+                            .iter()
+                            .filter(|c| c.id != drag_id)
+                            .map(|c| (c.timeline_start, c.timeline_end()))
+                            .collect();
+
+                        // Snap: this clip's start → other clip's end (and vice versa).
+                        let mut best_snap: Option<f64> = None;
+                        let mut best_dist = snap_threshold;
+                        for &(os, oe) in &other_edges {
+                            // My start → their end.
+                            let d = (new_start - oe).abs();
+                            if d < best_dist {
+                                best_dist = d;
+                                best_snap = Some(oe);
+                            }
+                            // My end → their start.
+                            let d = (new_end - os).abs();
+                            if d < best_dist {
+                                best_dist = d;
+                                best_snap = Some(os - clip_dur);
+                            }
+                            // My start → their start.
+                            let d = (new_start - os).abs();
+                            if d < best_dist {
+                                best_dist = d;
+                                best_snap = Some(os);
+                            }
+                        }
+                        // Snap to time 0.
+                        if new_start.abs() < snap_threshold && new_start.abs() < best_dist {
+                            best_snap = Some(0.0);
+                        }
+                        if let Some(s) = best_snap {
+                            new_start = s.max(0.0);
+                        }
+
+                        // Prevent overlap: clamp so we don't sit on top of others.
+                        let mut clamped_start = new_start;
+                        for &(os, oe) in &other_edges {
+                            let cs = clamped_start;
+                            let ce = clamped_start + clip_dur;
+                            // If overlapping, push to the nearest side.
+                            if ce > os && cs < oe {
+                                let push_right = oe - cs;
+                                let push_left = ce - os;
+                                if push_left <= push_right {
+                                    clamped_start = os - clip_dur;
+                                } else {
+                                    clamped_start = oe;
+                                }
+                            }
+                        }
+                        clamped_start = clamped_start.max(0.0);
+
+                        if let Some(clip) = self.project.timeline.clip_mut(drag_id) {
+                            clip.timeline_start = clamped_start;
+                        }
+                    }
+                } else if resp.dragged() {
+                    // Not dragging clip or playhead → scrub the playhead.
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        self.project.timeline.set_playhead(t);
+                        if playhead_not_playing {
                             self.request_scrub_frame();
                         }
                     }
@@ -691,6 +798,7 @@ impl FreetasiaApp {
                         self.project.timeline.sort_clips();
                         self.dragging_clip_id = None;
                     }
+                    self.dragging_playhead = false;
                 }
 
                 // Click (no drag): move playhead + select clip.
@@ -698,7 +806,7 @@ impl FreetasiaApp {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         self.project.timeline.set_playhead(t);
-                        if self.player.state() == PlaybackState::Stopped {
+                        if playhead_not_playing {
                             self.request_scrub_frame();
                         }
                         let py = pos.y - (origin.y + ruler_h);
