@@ -1,0 +1,29 @@
+[package]
+name = "freetasia"
+version = "0.1.0"
+edition = "2021"
+description = "A free, open-source screen recorder and video editor for Windows"
+authors = ["Freetasia Contributors"]
+
+[lib]
+name = "freetasia"
+path = "src/lib.rs"
+
+[[bin]]
+name = "freetasia"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.27"
+egui = "0.27"
+cpal = "0.15"
+screenshots = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+hound = "3.5"
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
