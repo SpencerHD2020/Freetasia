@@ -114,3 +114,72 @@ fn export_empty_timeline_errors() {
 fn ffmpeg_availability_check_does_not_panic() {
     let _ = export::ffmpeg_available();
 }
+
+// ── Speed tests ─────────────────────────────────────────────────────────────
+
+#[test]
+fn clip_speed_doubles_playback() {
+    let mut clip = Clip::new(1, PathBuf::from("a.mp4"), 10.0, "A");
+    clip.speed = 2.0;
+    assert!((clip.duration() - 5.0).abs() < 1e-9);
+    assert!((clip.source_duration() - 10.0).abs() < 1e-9);
+}
+
+#[test]
+fn clip_speed_half_slows_playback() {
+    let mut clip = Clip::new(1, PathBuf::from("a.mp4"), 10.0, "A");
+    clip.speed = 0.5;
+    assert!((clip.duration() - 20.0).abs() < 1e-9);
+}
+
+#[test]
+fn clip_speed_affects_timeline_end() {
+    let mut clip = Clip::new(1, PathBuf::from("a.mp4"), 10.0, "A");
+    clip.speed = 2.0;
+    clip.timeline_start = 5.0;
+    assert!((clip.timeline_end() - 10.0).abs() < 1e-9);
+}
+
+// ── Split tests ─────────────────────────────────────────────────────────────
+
+#[test]
+fn split_clip_at_midpoint() {
+    let mut tl = Timeline::new();
+    let id = tl.add_clip(Clip::new(0, PathBuf::from("a.mp4"), 10.0, "A"));
+    let new_id = tl.split_clip(id, 5.0);
+    assert!(new_id.is_some());
+    assert_eq!(tl.clips().len(), 2);
+    assert!((tl.clips()[0].trim_start - 0.0).abs() < 1e-9);
+    assert!((tl.clips()[0].trim_end - 5.0).abs() < 1e-9);
+    assert!((tl.clips()[1].trim_start - 5.0).abs() < 1e-9);
+    assert!((tl.clips()[1].trim_end - 10.0).abs() < 1e-9);
+    assert!((tl.clips()[1].timeline_start - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn split_clip_outside_range_returns_none() {
+    let mut tl = Timeline::new();
+    let id = tl.add_clip(Clip::new(0, PathBuf::from("a.mp4"), 10.0, "A"));
+    assert!(tl.split_clip(id, 0.0).is_none());
+    assert!(tl.split_clip(id, 10.0).is_none());
+    assert!(tl.split_clip(id, -1.0).is_none());
+    assert!(tl.split_clip(id, 11.0).is_none());
+}
+
+#[test]
+fn split_clip_with_speed() {
+    let mut tl = Timeline::new();
+    let mut clip = Clip::new(0, PathBuf::from("a.mp4"), 10.0, "A");
+    clip.speed = 2.0; // 10s source → 5s timeline
+    let id = tl.add_clip(clip);
+    // Split at 2.5s on the timeline (midpoint).
+    let new_id = tl.split_clip(id, 2.5);
+    assert!(new_id.is_some());
+    assert_eq!(tl.clips().len(), 2);
+    // First clip: source 0-5s, speed 2, timeline duration 2.5s.
+    assert!((tl.clips()[0].trim_end - 5.0).abs() < 1e-9);
+    assert!((tl.clips()[0].duration() - 2.5).abs() < 1e-9);
+    // Second clip: source 5-10s, speed 2, timeline duration 2.5s.
+    assert!((tl.clips()[1].trim_start - 5.0).abs() < 1e-9);
+    assert!((tl.clips()[1].duration() - 2.5).abs() < 1e-9);
+}

@@ -21,7 +21,7 @@ impl Default for Project {
         Self {
             name: "Untitled Project".into(),
             timeline: Timeline::new(),
-            output_fps: 30,
+            output_fps: 60,
             output_resolution: (1920, 1080),
         }
     }

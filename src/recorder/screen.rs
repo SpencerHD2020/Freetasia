@@ -9,6 +9,17 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+/// Apply platform-specific flags to hide the console window on Windows.
+#[cfg(target_os = "windows")]
+fn hide_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console_window(_cmd: &mut Command) {}
+
 /// A single captured video frame together with its presentation timestamp.
 #[derive(Clone)]
 pub struct FrameData {
@@ -205,8 +216,8 @@ fn spawn_ffmpeg_encoder(
     let fps_str = fps.to_string();
     let out = output_path.to_string_lossy();
 
-    Command::new("ffmpeg")
-        .args([
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
             "-y",
             "-f", "rawvideo",
             "-pixel_format", "rgba",
@@ -220,7 +231,8 @@ fn spawn_ffmpeg_encoder(
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    hide_console_window(&mut cmd);
+    cmd.spawn()
         .context("Failed to spawn ffmpeg — is it installed and on PATH?")
 }

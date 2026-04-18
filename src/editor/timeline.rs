@@ -57,9 +57,60 @@ impl Timeline {
         self.playhead = pos.clamp(0.0, self.total_duration().max(0.0));
     }
 
+    /// Split a clip at the given timeline position into two clips.
+    ///
+    /// Returns the id of the newly created second clip, or `None` if the
+    /// split position is outside the clip.
+    pub fn split_clip(&mut self, clip_id: u64, split_at: f64) -> Option<u64> {
+        let idx = self.clips.iter().position(|c| c.id == clip_id)?;
+
+        let tl_start = self.clips[idx].timeline_start;
+        let tl_end = self.clips[idx].timeline_end();
+        let speed = self.clips[idx].speed;
+        let trim_start = self.clips[idx].trim_start;
+
+        if split_at <= tl_start || split_at >= tl_end {
+            return None;
+        }
+
+        let offset = split_at - tl_start;
+        let source_offset = offset * speed;
+        let split_source = trim_start + source_offset;
+
+        // Create the second half.
+        let mut second = self.clips[idx].clone();
+        second.trim_start = split_source;
+        second.timeline_start = split_at;
+        second.label = format!("{} (2)", second.label);
+        let second_id = self.next_id;
+        self.next_id += 1;
+        second.id = second_id;
+
+        // Shorten the first clip to end at the split point.
+        self.clips[idx].trim_end = split_source;
+
+        self.clips.push(second);
+        self.clips.sort_by(|a, b| {
+            a.timeline_start
+                .partial_cmp(&b.timeline_start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Some(second_id)
+    }
+
     /// Is the timeline empty?
     pub fn is_empty(&self) -> bool {
         self.clips.is_empty()
+    }
+
+    /// Sort clips by their timeline_start position.
+    pub fn sort_clips(&mut self) {
+        self.clips.sort_by(|a, b| {
+            a.timeline_start
+                .partial_cmp(&b.timeline_start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 }
 

@@ -42,7 +42,7 @@ impl Default for RecorderManager {
             paused_accum: Duration::ZERO,
             pause_start: None,
             monitor_index: 0,
-            fps: 15,
+            fps: 60,
             record_audio: true,
             output_dir: std::env::temp_dir().join("freetasia"),
         }

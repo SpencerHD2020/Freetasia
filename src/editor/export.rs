@@ -4,6 +4,17 @@ use std::process::Command;
 
 use super::timeline::Timeline;
 
+/// Apply platform-specific flags to hide the console window on Windows.
+#[cfg(target_os = "windows")]
+fn hide_console_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console_window(_cmd: &mut Command) {}
+
 /// Build and run an ffmpeg command that realises the timeline as a single
 /// output video file.
 ///
@@ -39,8 +50,9 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
     // Filter complex: trim each video stream, then concatenate.
     let mut filter = String::new();
     for (i, clip) in clips.iter().enumerate() {
+        let speed_factor = 1.0 / clip.speed;
         filter.push_str(&format!(
-            "[{i}:v]trim=start={start}:end={end},setpts=PTS-STARTPTS[v{i}];",
+            "[{i}:v]trim=start={start}:end={end},setpts={speed_factor}*(PTS-STARTPTS)[v{i}];",
             start = clip.trim_start,
             end = clip.trim_end,
         ));
@@ -79,8 +91,10 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
 
     log::info!("Running: {} {}", ffmpeg, args.join(" "));
 
-    let status = Command::new(&ffmpeg)
-        .args(&args)
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args(&args);
+    hide_console_window(&mut cmd);
+    let status = cmd
         .status()
         .context("Failed to spawn ffmpeg")?;
 
@@ -91,7 +105,10 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
 /// Return the path to the ffmpeg executable, searching common locations.
 pub fn find_ffmpeg() -> Result<String> {
     // Try plain name first (on PATH).
-    if Command::new("ffmpeg").arg("-version").output().is_ok() {
+    let mut probe = Command::new("ffmpeg");
+    probe.arg("-version");
+    hide_console_window(&mut probe);
+    if probe.output().is_ok() {
         return Ok("ffmpeg".into());
     }
     // Common Windows install location.

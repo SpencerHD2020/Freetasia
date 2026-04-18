@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::editor::{
     clip::Clip,
     export,
+    player::{PlaybackState, VideoPlayer},
     project::Project,
 };
 use crate::recorder::{
@@ -38,9 +39,15 @@ pub struct FreetasiaApp {
     // ── Preview ──
     preview_texture: Option<egui::TextureHandle>,
 
+    // ── Playback ──
+    player: VideoPlayer,
+
     // ── Timeline UI ──
     /// Pixels per second (zoom).
     zoom: f32,
+    /// Clip being dragged on the timeline (id + offset from clip start to grab point).
+    dragging_clip_id: Option<u64>,
+    drag_offset: f64,
 
     // ── Dialogs / overlays ──
     show_export_dialog: bool,
@@ -61,7 +68,10 @@ impl FreetasiaApp {
             project: Project::default(),
             selected_clip_id: None,
             preview_texture: None,
+            player: VideoPlayer::new(),
             zoom: 80.0,
+            dragging_clip_id: None,
+            drag_offset: 0.0,
             show_export_dialog: false,
             export_path: String::new(),
             show_about: false,
@@ -80,8 +90,16 @@ impl eframe::App for FreetasiaApp {
         // Pull latest preview frame from the recorder (non-blocking).
         self.refresh_preview(ctx);
 
-        // Keep repainting while recording so the timer updates every frame.
-        if self.recorder.state() == RecordingState::Recording {
+        // Advance playback and pull decoded frames.
+        self.refresh_playback(ctx);
+
+        // Pull scrub preview frame when not playing.
+        self.refresh_scrub_preview(ctx);
+
+        // Keep repainting while recording or playing.
+        if self.recorder.state() == RecordingState::Recording
+            || self.player.state() == PlaybackState::Playing
+        {
             ctx.request_repaint();
         }
 
@@ -201,7 +219,7 @@ impl FreetasiaApp {
 
     fn draw_preview(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
-        let preview_size = Vec2::new(available.x, (available.x * 9.0 / 16.0).min(available.y - 8.0));
+        let preview_size = Vec2::new(available.x, (available.x * 9.0 / 16.0).min(available.y - 42.0));
 
         if let Some(ref tex) = self.preview_texture {
             ui.image((tex.id(), preview_size));
@@ -218,6 +236,50 @@ impl FreetasiaApp {
                 Color32::from_gray(120),
             );
         }
+
+        // ── Playback transport ──
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let is_playing = self.player.state() == PlaybackState::Playing;
+            let is_paused = self.player.state() == PlaybackState::Paused;
+            let is_recording = self.recorder.state() != RecordingState::Idle;
+            let can_play =
+                !self.project.timeline.is_empty() && !is_recording && self.ffmpeg_ok;
+
+            if is_playing {
+                if ui.button("⏸  Pause").clicked() {
+                    self.player.pause();
+                }
+                if ui.button("⏹  Stop").clicked() {
+                    self.player.stop();
+                    self.status("Playback stopped");
+                }
+            } else if is_paused {
+                if ui.button("▶  Resume").clicked() {
+                    self.player.resume();
+                }
+                if ui.button("⏹  Stop").clicked() {
+                    self.player.stop();
+                    self.status("Playback stopped");
+                }
+            } else if ui
+                .add_enabled(can_play, egui::Button::new("▶  Play"))
+                .on_hover_text("Play timeline from playhead")
+                .clicked()
+            {
+                self.start_playback();
+            }
+
+            // Playback position display.
+            if is_playing || is_paused {
+                let pos = self.player.current_position();
+                ui.label(
+                    RichText::new(fmt_duration_hms(pos))
+                        .monospace()
+                        .size(14.0),
+                );
+            }
+        });
     }
 
     fn refresh_preview(&mut self, ctx: &egui::Context) {
@@ -239,6 +301,118 @@ impl FreetasiaApp {
         }
     }
 
+    // ── Playback ─────────────────────────────────────────────────────────────
+
+    fn refresh_playback(&mut self, ctx: &egui::Context) {
+        if self.player.state() == PlaybackState::Stopped {
+            return;
+        }
+
+        let pos = self.player.current_position();
+        self.project.timeline.set_playhead(pos);
+
+        if let Some(frame) = self.player.try_recv_frame() {
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            match self.preview_texture.as_mut() {
+                Some(tex) => tex.set(color_image, egui::TextureOptions::default()),
+                None => {
+                    self.preview_texture = Some(ctx.load_texture(
+                        "preview",
+                        color_image,
+                        egui::TextureOptions::default(),
+                    ));
+                }
+            }
+        }
+
+        if self.player.is_finished() {
+            self.player.stop();
+            self.status("Playback finished");
+        }
+    }
+
+    fn start_playback(&mut self) {
+        let clips = self.project.timeline.clips();
+        if clips.is_empty() {
+            return;
+        }
+
+        let (width, height) = clips
+            .iter()
+            .find_map(|c| crate::editor::player::probe_video_resolution(&c.source_path))
+            .unwrap_or(self.project.output_resolution);
+
+        let segments: Vec<_> = clips
+            .iter()
+            .map(|c| {
+                (
+                    c.source_path.clone(),
+                    c.trim_start,
+                    c.source_duration(),
+                    c.speed,
+                    c.timeline_start,
+                    c.duration(),
+                )
+            })
+            .collect();
+
+        let start_pos = self.project.timeline.playhead;
+        self.player
+            .play(segments, start_pos, self.project.output_fps, width, height);
+        self.status("Playing");
+    }
+
+    fn refresh_scrub_preview(&mut self, ctx: &egui::Context) {
+        if let Some(frame) = self.player.try_recv_scrub_frame() {
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.rgba,
+            );
+            match self.preview_texture.as_mut() {
+                Some(tex) => tex.set(color_image, egui::TextureOptions::default()),
+                None => {
+                    self.preview_texture = Some(ctx.load_texture(
+                        "preview",
+                        color_image,
+                        egui::TextureOptions::default(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn request_scrub_frame(&mut self) {
+        let clips = self.project.timeline.clips();
+        if clips.is_empty() || !self.ffmpeg_ok {
+            return;
+        }
+
+        let (width, height) = clips
+            .iter()
+            .find_map(|c| crate::editor::player::probe_video_resolution(&c.source_path))
+            .unwrap_or(self.project.output_resolution);
+
+        let segments: Vec<_> = clips
+            .iter()
+            .map(|c| {
+                (
+                    c.source_path.clone(),
+                    c.trim_start,
+                    c.source_duration(),
+                    c.speed,
+                    c.timeline_start,
+                    c.duration(),
+                )
+            })
+            .collect();
+
+        let position = self.project.timeline.playhead;
+        self.player.seek_frame(segments, position, width, height);
+    }
+
     // ── Recording controls ──────────────────────────────────────────────────
 
     fn draw_recording_controls(&mut self, ui: &mut egui::Ui) {
@@ -254,8 +428,9 @@ impl FreetasiaApp {
             let rec_btn = egui::Button::new(rec_label)
                 .fill(if is_recording { Color32::from_rgb(180, 30, 30) } else { COLOR_RECORD })
                 .min_size(Vec2::new(110.0, 36.0));
+            let not_playing = self.player.state() == PlaybackState::Stopped;
             if ui
-                .add_enabled(is_idle && self.ffmpeg_ok, rec_btn)
+                .add_enabled(is_idle && self.ffmpeg_ok && not_playing, rec_btn)
                 .on_hover_text("Start recording")
                 .clicked()
             {
@@ -466,17 +641,66 @@ impl FreetasiaApp {
                 );
 
                 // ── Mouse interaction ────────────────────────────────────
-                if resp.clicked() || resp.dragged() {
+
+                // Detect drag start on a clip.
+                if resp.drag_started() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
-                        self.project.timeline.set_playhead(t);
+                        let py = pos.y - (origin.y + ruler_h);
+                        if py >= 0.0 && py <= track_h {
+                            // Check if pointer is over a clip.
+                            if let Some(clip) = self
+                                .project
+                                .timeline
+                                .clips()
+                                .iter()
+                                .find(|c| t >= c.timeline_start && t <= c.timeline_end())
+                            {
+                                self.dragging_clip_id = Some(clip.id);
+                                self.drag_offset = t - clip.timeline_start;
+                                self.selected_clip_id = Some(clip.id);
+                            }
+                        }
                     }
                 }
 
-                // Clip selection on click.
+                // While dragging a clip, move it.
+                if resp.dragged() && self.dragging_clip_id.is_some() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        let new_start = (t - self.drag_offset).max(0.0);
+                        let drag_id = self.dragging_clip_id.unwrap();
+                        if let Some(clip) = self.project.timeline.clip_mut(drag_id) {
+                            clip.timeline_start = new_start;
+                        }
+                    }
+                } else if resp.dragged() {
+                    // Not dragging a clip → scrub the playhead.
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        self.project.timeline.set_playhead(t);
+                        if self.player.state() == PlaybackState::Stopped {
+                            self.request_scrub_frame();
+                        }
+                    }
+                }
+
+                // End drag.
+                if resp.drag_stopped() {
+                    if self.dragging_clip_id.is_some() {
+                        self.project.timeline.sort_clips();
+                        self.dragging_clip_id = None;
+                    }
+                }
+
+                // Click (no drag): move playhead + select clip.
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        self.project.timeline.set_playhead(t);
+                        if self.player.state() == PlaybackState::Stopped {
+                            self.request_scrub_frame();
+                        }
                         let py = pos.y - (origin.y + ruler_h);
                         if py >= 0.0 && py <= track_h {
                             self.selected_clip_id = self
@@ -516,6 +740,23 @@ impl FreetasiaApp {
                             .clamp_range((clip.trim_start + 0.1)..=trim_end_max + 3600.0)
                             .suffix("s"),
                     );
+                    ui.label("  Speed:");
+                    ui.add(
+                        egui::DragValue::new(&mut clip.speed)
+                            .speed(0.1)
+                            .clamp_range(0.25..=50.0)
+                            .suffix("x"),
+                    );
+                }
+                if ui
+                    .button("✂ Split")
+                    .on_hover_text("Split clip at playhead")
+                    .clicked()
+                {
+                    let playhead = self.project.timeline.playhead;
+                    if let Some(_new_id) = self.project.timeline.split_clip(sel_id, playhead) {
+                        self.status("Clip split at playhead");
+                    }
                 }
                 if ui.button("🗑 Delete").clicked() {
                     self.project.timeline.remove_clip(sel_id);

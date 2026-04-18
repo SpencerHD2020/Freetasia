@@ -16,6 +16,13 @@ pub struct Clip {
     pub timeline_start: f64,
     /// Human-readable label shown in the timeline.
     pub label: String,
+    /// Playback speed multiplier (1.0 = normal, 2.0 = 2× fast, 0.5 = half speed).
+    #[serde(default = "default_speed")]
+    pub speed: f64,
+}
+
+fn default_speed() -> f64 {
+    1.0
 }
 
 impl Clip {
@@ -28,12 +35,18 @@ impl Clip {
             trim_end: duration,
             timeline_start: 0.0,
             label: label.into(),
+            speed: 1.0,
         }
     }
 
-    /// Duration of the clip after trimming, in seconds.
-    pub fn duration(&self) -> f64 {
+    /// Duration of the source segment before speed adjustment, in seconds.
+    pub fn source_duration(&self) -> f64 {
         (self.trim_end - self.trim_start).max(0.0)
+    }
+
+    /// Duration of the clip on the timeline after speed adjustment, in seconds.
+    pub fn duration(&self) -> f64 {
+        (self.source_duration() / self.speed).max(0.0)
     }
 
     /// End position of this clip on the project timeline, in seconds.
