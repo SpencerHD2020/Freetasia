@@ -54,6 +54,15 @@ struct PlaySegment {
     timeline_duration: f64,
 }
 
+/// Buffered scrub request for when a decode is already in flight.
+#[derive(Clone)]
+struct ScrubRequest {
+    segments: Vec<(PathBuf, f64, f64, f64, f64, f64)>,
+    position: f64,
+    width: u32,
+    height: u32,
+}
+
 /// Video playback engine – decodes clips via ffmpeg and streams RGBA frames.
 pub struct VideoPlayer {
     state: PlaybackState,
@@ -69,6 +78,10 @@ pub struct VideoPlayer {
     scrub_rx: Option<Receiver<DecodedFrame>>,
     scrub_thread: Option<JoinHandle<()>>,
     scrub_cancel: Arc<AtomicBool>,
+    /// True while a scrub decode is in flight.
+    scrub_busy: bool,
+    /// Pending scrub request queued while a decode was in flight.
+    scrub_pending: Option<ScrubRequest>,
 }
 
 impl Default for VideoPlayer {
@@ -86,6 +99,8 @@ impl Default for VideoPlayer {
             scrub_rx: None,
             scrub_thread: None,
             scrub_cancel: Arc::new(AtomicBool::new(false)),
+            scrub_busy: false,
+            scrub_pending: None,
         }
     }
 }
@@ -213,8 +228,10 @@ impl VideoPlayer {
 
     /// Request a single frame at `position` on the timeline for scrub preview.
     ///
-    /// Each segment tuple: `(source_path, trim_start, source_duration, speed,
-    ///                       timeline_start, timeline_duration)`.
+    /// If a scrub decode is already in flight, the request is queued and will
+    /// be dispatched automatically once the current decode finishes (via
+    /// `try_recv_scrub_frame`). This prevents spawning an ffmpeg process per
+    /// drag event while still always converging on the latest position.
     pub fn seek_frame(
         &mut self,
         segments: Vec<(PathBuf, f64, f64, f64, f64, f64)>,
@@ -222,14 +239,38 @@ impl VideoPlayer {
         width: u32,
         height: u32,
     ) {
-        // Cancel any in-flight scrub.
-        self.scrub_cancel.store(true, Ordering::SeqCst);
-        // Don't block waiting for the old thread — just detach it.
-        self.scrub_thread = None;
-
         if width == 0 || height == 0 || segments.is_empty() {
             return;
         }
+
+        // Check if the previous scrub thread has finished.
+        self.check_scrub_done();
+
+        if self.scrub_busy {
+            // A decode is running — just remember the latest request.
+            self.scrub_pending = Some(ScrubRequest {
+                segments,
+                position,
+                width,
+                height,
+            });
+            return;
+        }
+
+        self.dispatch_scrub(segments, position, width, height);
+    }
+
+    /// Actually spawn the ffmpeg scrub thread.
+    fn dispatch_scrub(
+        &mut self,
+        segments: Vec<(PathBuf, f64, f64, f64, f64, f64)>,
+        position: f64,
+        width: u32,
+        height: u32,
+    ) {
+        // Cancel any leftover (shouldn't happen, but be safe).
+        self.scrub_cancel.store(true, Ordering::SeqCst);
+        self.scrub_thread = None;
 
         let cancel = Arc::new(AtomicBool::new(false));
         self.scrub_cancel = cancel.clone();
@@ -245,11 +286,54 @@ impl VideoPlayer {
             .ok();
 
         self.scrub_thread = thread;
+        self.scrub_busy = true;
+    }
+
+    /// Check whether the scrub thread has finished.
+    fn check_scrub_done(&mut self) {
+        if !self.scrub_busy {
+            return;
+        }
+        // The thread is done if it has been joined or is no longer alive.
+        if let Some(ref h) = self.scrub_thread {
+            if !h.is_finished() {
+                return;
+            }
+        }
+        // Thread done — clean up.
+        if let Some(h) = self.scrub_thread.take() {
+            let _ = h.join();
+        }
+        self.scrub_busy = false;
     }
 
     /// Non-blocking: grab the scrub preview frame (if ready).
-    pub fn try_recv_scrub_frame(&self) -> Option<DecodedFrame> {
-        self.scrub_rx.as_ref()?.try_recv().ok()
+    ///
+    /// When a frame arrives and a newer scrub request is pending, this
+    /// automatically dispatches the queued request so the preview converges.
+    pub fn try_recv_scrub_frame(&mut self) -> Option<DecodedFrame> {
+        let frame = self.scrub_rx.as_ref()?.try_recv().ok();
+
+        if frame.is_some() {
+            // The decode finished — mark as not busy and dispatch pending.
+            self.scrub_busy = false;
+            if let Some(h) = self.scrub_thread.take() {
+                let _ = h.join();
+            }
+            if let Some(req) = self.scrub_pending.take() {
+                self.dispatch_scrub(req.segments, req.position, req.width, req.height);
+            }
+        } else {
+            // No frame yet — but check if thread died without sending.
+            self.check_scrub_done();
+            if !self.scrub_busy {
+                if let Some(req) = self.scrub_pending.take() {
+                    self.dispatch_scrub(req.segments, req.position, req.width, req.height);
+                }
+            }
+        }
+
+        frame
     }
 }
 
