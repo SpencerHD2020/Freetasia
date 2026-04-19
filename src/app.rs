@@ -1693,6 +1693,7 @@ impl FreetasiaApp {
             let id = self.project.timeline.add_clip(clip);
             self.selected_clip_id = Some(id);
             self.invalidate_resolution_cache();
+            self.request_scrub_frame();
             self.status(format!("Recording added to timeline ({:.1}s)", dur));
         }
     }

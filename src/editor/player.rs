@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+use super::export::{find_ffmpeg, find_ffprobe};
+
 /// Apply platform-specific flags to hide the console window on Windows.
 #[cfg(target_os = "windows")]
 fn hide_console_window(cmd: &mut Command) {
@@ -391,7 +393,14 @@ fn decode_segments(
             "setpts={speed_factor}*(PTS-STARTPTS),scale={width}:{height}:flags=bilinear"
         );
 
-        let mut cmd = Command::new("ffmpeg");
+        let ffmpeg_path = match find_ffmpeg() {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Cannot find ffmpeg for decode: {e}");
+                return;
+            }
+        };
+        let mut cmd = Command::new(&ffmpeg_path);
         cmd.args(["-ss", &format!("{seek_pos:.3}")])
             .arg("-i")
             .arg(&seg.source_path)
@@ -505,7 +514,11 @@ fn decode_single_frame(
             continue;
         }
 
-        let mut cmd = Command::new("ffmpeg");
+        let ffmpeg_path = match find_ffmpeg() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut cmd = Command::new(&ffmpeg_path);
         cmd.args(["-noaccurate_seek", "-ss", &format!("{seek_pos:.3}")])
             .arg("-i")
             .arg(source_path)
@@ -572,7 +585,8 @@ fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<
 
 /// Probe the resolution of a video file using ffprobe.
 pub fn probe_video_resolution(path: &std::path::Path) -> Option<(u32, u32)> {
-    let mut cmd = Command::new("ffprobe");
+    let ffprobe_path = find_ffprobe().ok()?;
+    let mut cmd = Command::new(&ffprobe_path);
     cmd.args([
             "-v",
             "error",

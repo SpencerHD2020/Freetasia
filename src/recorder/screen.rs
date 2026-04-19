@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+use crate::editor::export::find_ffmpeg;
+
 /// Apply platform-specific flags to hide the console window on Windows.
 #[cfg(target_os = "windows")]
 fn hide_console_window(cmd: &mut Command) {
@@ -216,7 +218,8 @@ fn spawn_ffmpeg_encoder(
     let fps_str = fps.to_string();
     let out = output_path.to_string_lossy();
 
-    let mut cmd = Command::new("ffmpeg");
+    let ffmpeg_path = find_ffmpeg()?;
+    let mut cmd = Command::new(&ffmpeg_path);
     cmd.args([
             "-y",
             "-f", "rawvideo",

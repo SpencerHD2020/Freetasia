@@ -37,10 +37,10 @@ Write-Host "    Copied freetasia.exe" -ForegroundColor Green
 # ── 4. Download ffmpeg if not cached ─────────────────────────────────────────
 $FfmpegCache = "target\tmp\ffmpeg"
 $FfmpegZip   = "target\tmp\ffmpeg.zip"
-$FfmpegUrl   = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip"
+$FfmpegUrl   = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
 
 if (-not (Test-Path "$FfmpegCache\ffmpeg.exe")) {
-    Write-Host "==> Downloading ffmpeg (LGPL shared build)..." -ForegroundColor Cyan
+    Write-Host "==> Downloading ffmpeg (GPL shared build)..." -ForegroundColor Cyan
     New-Item -ItemType Directory -Path "target\tmp" -Force | Out-Null
 
     # Download

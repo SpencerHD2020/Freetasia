@@ -256,6 +256,45 @@ pub fn find_ffmpeg() -> Result<String> {
     )
 }
 
+/// Return the path to the ffprobe executable, searching common locations.
+///
+/// Uses the same search strategy as [`find_ffmpeg`].
+pub fn find_ffprobe() -> Result<String> {
+    // 1. Check next to our own executable (bundled distribution).
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let bundled = exe_dir.join("ffprobe.exe");
+            if bundled.exists() {
+                return Ok(bundled.to_string_lossy().into_owned());
+            }
+            let subdir = exe_dir.join("ffmpeg").join("ffprobe.exe");
+            if subdir.exists() {
+                return Ok(subdir.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // 2. Try plain name (on PATH).
+    let mut probe = Command::new("ffprobe");
+    probe.arg("-version");
+    hide_console_window(&mut probe);
+    if probe.output().is_ok() {
+        return Ok("ffprobe".into());
+    }
+
+    // 3. Common Windows install location.
+    let win_path = r"C:\ffmpeg\bin\ffprobe.exe";
+    if Path::new(win_path).exists() {
+        return Ok(win_path.into());
+    }
+
+    anyhow::bail!(
+        "ffprobe not found. Place ffprobe.exe next to the Freetasia executable, \
+         or install ffmpeg and add it to your PATH. \
+         See https://ffmpeg.org/download.html"
+    )
+}
+
 /// Return `true` if ffmpeg is available on this machine.
 pub fn ffmpeg_available() -> bool {
     find_ffmpeg().is_ok()
