@@ -893,7 +893,7 @@ impl FreetasiaApp {
                     Stroke::new(1.0, Color32::from_gray(50)),
                 );
 
-                let edge_grab_w = 6.0_f32;
+                let edge_grab_w = 12.0_f32;
                 for overlay in self.project.timeline.text_overlays() {
                     let ox0 = origin.x + overlay.start as f32 * self.zoom;
                     let ox1 = origin.x + overlay.end as f32 * self.zoom;
@@ -907,35 +907,64 @@ impl FreetasiaApp {
                     painter.rect_filled(overlay_rect, 3.0, fill);
                     painter.rect_stroke(overlay_rect, 3.0, Stroke::new(1.0, Color32::from_gray(180)));
 
-                    // Draw resize handles (small bars on edges).
-                    let edge_color = Color32::from_gray(60);
+                    // Draw resize handles on edges — visible grab bars.
+                    let handle_visual_w = edge_grab_w.min((ox1 - ox0) * 0.35);
+                    let handle_color = if selected {
+                        Color32::from_rgb(200, 140, 0)
+                    } else {
+                        Color32::from_rgb(140, 100, 20)
+                    };
+                    // Left handle.
                     painter.rect_filled(
                         Rect::from_min_size(
                             Pos2::new(ox0, text_track_top),
-                            Vec2::new(edge_grab_w.min((ox1 - ox0) * 0.3), text_track_h),
+                            Vec2::new(handle_visual_w, text_track_h),
                         ),
                         2.0,
-                        edge_color,
+                        handle_color,
                     );
+                    // Left grip lines.
+                    let grip_x = ox0 + handle_visual_w * 0.5;
+                    for dy in [text_track_h * 0.3, text_track_h * 0.5, text_track_h * 0.7] {
+                        painter.line_segment(
+                            [
+                                Pos2::new(grip_x - 2.0, text_track_top + dy),
+                                Pos2::new(grip_x + 2.0, text_track_top + dy),
+                            ],
+                            Stroke::new(1.0, Color32::from_gray(40)),
+                        );
+                    }
+                    // Right handle.
                     painter.rect_filled(
                         Rect::from_min_size(
-                            Pos2::new(ox1 - edge_grab_w.min((ox1 - ox0) * 0.3), text_track_top),
-                            Vec2::new(edge_grab_w.min((ox1 - ox0) * 0.3), text_track_h),
+                            Pos2::new(ox1 - handle_visual_w, text_track_top),
+                            Vec2::new(handle_visual_w, text_track_h),
                         ),
                         2.0,
-                        edge_color,
+                        handle_color,
                     );
+                    // Right grip lines.
+                    let grip_x = ox1 - handle_visual_w * 0.5;
+                    for dy in [text_track_h * 0.3, text_track_h * 0.5, text_track_h * 0.7] {
+                        painter.line_segment(
+                            [
+                                Pos2::new(grip_x - 2.0, text_track_top + dy),
+                                Pos2::new(grip_x + 2.0, text_track_top + dy),
+                            ],
+                            Stroke::new(1.0, Color32::from_gray(40)),
+                        );
+                    }
 
                     // Text label inside the block.
                     let clip_w = ox1 - ox0;
-                    if clip_w > 20.0 {
+                    if clip_w > 30.0 {
                         let label = if overlay.text.len() > 20 {
                             format!("{}…", &overlay.text[..19])
                         } else {
                             overlay.text.clone()
                         };
                         painter.text(
-                            Pos2::new(ox0 + edge_grab_w + 2.0, text_track_top + 3.0),
+                            Pos2::new(ox0 + handle_visual_w + 2.0, text_track_top + 3.0),
                             egui::Align2::LEFT_TOP,
                             label,
                             egui::FontId::proportional(11.0),
@@ -1479,7 +1508,7 @@ impl FreetasiaApp {
             }
         });
 
-        // ── Text overlay inspector ────────────────────────────────────────
+        // ── Text overlay inspector (single compact row) ──────────────────
         if let Some(sel_id) = self.selected_overlay_id {
             if self.project.timeline.text_overlay_mut(sel_id).is_some() {
                 ui.separator();
@@ -1487,47 +1516,18 @@ impl FreetasiaApp {
                     ui.label("Text:");
                     let tl = &mut self.project.timeline;
                     if let Some(overlay) = tl.text_overlay_mut(sel_id) {
-                        ui.text_edit_singleline(&mut overlay.text);
-                        ui.label("  Start:");
-                        ui.add(
-                            egui::DragValue::new(&mut overlay.start)
-                                .speed(0.1)
-                                .clamp_range(0.0..=overlay.end - 0.1)
-                                .suffix("s"),
-                        );
-                        ui.label("  End:");
-                        ui.add(
-                            egui::DragValue::new(&mut overlay.end)
-                                .speed(0.1)
-                                .clamp_range((overlay.start + 0.1)..=f64::MAX)
-                                .suffix("s"),
-                        );
-                        ui.label("  Size:");
+                        let mut buf = overlay.text.clone();
+                        if ui.add(egui::TextEdit::singleline(&mut buf).desired_width(120.0)).changed() {
+                            overlay.text = buf;
+                        }
+                        ui.label("Size:");
                         ui.add(
                             egui::DragValue::new(&mut overlay.font_size)
                                 .speed(1.0)
                                 .clamp_range(8.0..=200.0)
                                 .suffix("px"),
                         );
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Position:");
-                    let tl = &mut self.project.timeline;
-                    if let Some(overlay) = tl.text_overlay_mut(sel_id) {
-                        ui.label("X:");
-                        ui.add(
-                            egui::DragValue::new(&mut overlay.x)
-                                .speed(0.01)
-                                .clamp_range(0.0..=1.0),
-                        );
-                        ui.label("Y:");
-                        ui.add(
-                            egui::DragValue::new(&mut overlay.y)
-                                .speed(0.01)
-                                .clamp_range(0.0..=1.0),
-                        );
-                        ui.label("  Color:");
+                        ui.label("Color:");
                         let mut color = egui::Color32::from_rgba_unmultiplied(
                             overlay.color[0],
                             overlay.color[1],
@@ -1537,8 +1537,21 @@ impl FreetasiaApp {
                         if ui.color_edit_button_srgba(&mut color).changed() {
                             overlay.color = [color.r(), color.g(), color.b(), color.a()];
                         }
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!(
+                                "{} – {}",
+                                fmt_duration(overlay.start),
+                                fmt_duration(overlay.end),
+                            ))
+                            .color(Color32::from_gray(160)),
+                        );
+                        ui.label(
+                            RichText::new("(Drag edges on timeline to resize)")
+                                .color(Color32::from_gray(120))
+                                .italics(),
+                        );
                     }
-                    ui.label("  (Drag text in preview to reposition)");
                 });
             }
         }
