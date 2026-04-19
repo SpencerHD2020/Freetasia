@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::editor::{
     clip::Clip,
-    export,
+    export::{self, ExportProgress},
     player::{PlaybackState, VideoPlayer},
     project::Project,
     text_overlay::TextOverlay,
@@ -89,6 +89,11 @@ pub struct FreetasiaApp {
     show_about: bool,
     status_msg: String,
     ffmpeg_ok: bool,
+
+    // ── Export progress ──
+    export_progress: Option<f32>,
+    export_progress_rx: Option<crossbeam_channel::Receiver<ExportProgress>>,
+    exporting: bool,
 }
 
 impl FreetasiaApp {
@@ -127,6 +132,9 @@ impl FreetasiaApp {
                 "⚠ ffmpeg not found — recording/export disabled".into()
             },
             ffmpeg_ok,
+            export_progress: None,
+            export_progress_rx: None,
+            exporting: false,
         }
     }
 }
@@ -142,10 +150,14 @@ impl eframe::App for FreetasiaApp {
         // Pull scrub preview frame when not playing.
         self.refresh_scrub_preview(ctx);
 
-        // Keep repainting while recording, playing, or waiting for a scrub frame.
+        // Poll export progress (non-blocking).
+        self.poll_export_progress();
+
+        // Keep repainting while recording, playing, exporting, or waiting for a scrub frame.
         if self.recorder.state() == RecordingState::Recording
             || self.player.state() == PlaybackState::Playing
             || self.player.is_scrub_busy()
+            || self.exporting
         {
             ctx.request_repaint();
         }
@@ -1549,17 +1561,50 @@ impl FreetasiaApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.label("Output file path:");
-                ui.text_edit_singleline(&mut self.export_path);
-                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Export").clicked() {
-                        self.do_export();
-                        self.show_export_dialog = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.show_export_dialog = false;
+                    ui.text_edit_singleline(&mut self.export_path);
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Export Video")
+                            .add_filter("MP4 Video", &["mp4"])
+                            .add_filter("All files", &["*"])
+                            .set_file_name(
+                                PathBuf::from(&self.export_path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "output.mp4".into()),
+                            )
+                            .save_file()
+                        {
+                            self.export_path = path.to_string_lossy().into_owned();
+                        }
                     }
                 });
+                ui.add_space(8.0);
+
+                // Show progress bar if exporting.
+                if self.exporting {
+                    let progress = self.export_progress.unwrap_or(0.0);
+                    let bar = egui::ProgressBar::new(progress)
+                        .text(format!("Exporting… {:.0}%", progress * 100.0))
+                        .animate(true);
+                    ui.add(bar);
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Please wait — encoding video with ffmpeg")
+                            .color(Color32::from_gray(160))
+                            .italics(),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Export").clicked() {
+                            self.do_export();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_export_dialog = false;
+                        }
+                    });
+                }
             });
         self.show_export_dialog = open;
     }
@@ -1641,9 +1686,45 @@ impl FreetasiaApp {
 
     fn do_export(&mut self) {
         let output = PathBuf::from(&self.export_path);
-        match export::export_timeline(&self.project.timeline, &output) {
-            Ok(()) => self.status(format!("Exported to {}", output.display())),
+        let (tx, rx) = crossbeam_channel::unbounded();
+        match export::export_timeline_async(&self.project.timeline, &output, tx) {
+            Ok(()) => {
+                self.exporting = true;
+                self.export_progress = Some(0.0);
+                self.export_progress_rx = Some(rx);
+                self.status("Exporting…");
+            }
             Err(e) => self.status(format!("Export failed: {e}")),
+        }
+    }
+
+    fn poll_export_progress(&mut self) {
+        let rx = match self.export_progress_rx.as_ref() {
+            Some(rx) => rx,
+            None => return,
+        };
+        // Drain all pending messages.
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ExportProgress::Progress(frac) => {
+                    self.export_progress = Some(frac);
+                }
+                ExportProgress::Done => {
+                    self.exporting = false;
+                    self.export_progress = None;
+                    self.export_progress_rx = None;
+                    self.show_export_dialog = false;
+                    self.status(format!("Exported to {}", self.export_path));
+                    return;
+                }
+                ExportProgress::Error(msg) => {
+                    self.exporting = false;
+                    self.export_progress = None;
+                    self.export_progress_rx = None;
+                    self.status(format!("Export failed: {msg}"));
+                    return;
+                }
+            }
         }
     }
 

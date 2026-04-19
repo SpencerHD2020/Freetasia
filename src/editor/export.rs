@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use super::timeline::Timeline;
 
@@ -15,30 +16,28 @@ fn hide_console_window(cmd: &mut Command) {
 #[cfg(not(target_os = "windows"))]
 fn hide_console_window(_cmd: &mut Command) {}
 
-/// Build and run an ffmpeg command that realises the timeline as a single
-/// output video file.
-///
-/// # Requirements
-/// `ffmpeg` must be available on `PATH`.  The function checks for this first
-/// and returns a helpful error if it is missing.
-///
-/// # Filter graph
-/// For each clip the function emits an `[i:v]trim / setpts` filter and then
-/// concatenates them all.  Audio from the first clip's paired WAV file (same
-/// stem with `.wav` extension) is mixed in when present.
-pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
+/// Progress state shared between the export thread and the UI.
+#[derive(Clone, Debug)]
+pub enum ExportProgress {
+    /// Fraction in 0.0..=1.0.
+    Progress(f32),
+    /// Export finished successfully.
+    Done,
+    /// Export failed with an error message.
+    Error(String),
+}
+
+/// Build the ffmpeg argument list for a timeline export (internal helper).
+fn build_ffmpeg_args(timeline: &Timeline, output_path: &Path) -> Result<(String, Vec<String>)> {
     anyhow::ensure!(
         !timeline.is_empty(),
         "Cannot export an empty timeline"
     );
 
-    // Verify ffmpeg is reachable.
     let ffmpeg = find_ffmpeg()?;
-
     let clips = timeline.clips();
     let n = clips.len();
 
-    // ── Build the ffmpeg argument list ────────────────────────────────────
     let mut args: Vec<String> = Vec::new();
 
     // Input files: one per clip.
@@ -57,7 +56,6 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
             end = clip.trim_end,
         ));
     }
-    // Concat video segments.
     for i in 0..n {
         filter.push_str(&format!("[v{i}]"));
     }
@@ -75,7 +73,6 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
             } else {
                 format!("txt{i}")
             };
-            // Escape special characters for ffmpeg drawtext.
             let escaped_text = overlay
                 .text
                 .replace('\\', "\\\\\\\\")
@@ -86,7 +83,6 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
             let b = overlay.color[2];
             let a = overlay.color[3];
             let fontcolor = format!("#{r:02x}{g:02x}{b:02x}{a:02x}");
-            // Position: x/y are fractions of video size.
             let x_expr = format!("w*{}-tw/2", overlay.x);
             let y_expr = format!("h*{}-th/2", overlay.y);
             filter.push_str(&format!(
@@ -108,14 +104,12 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
     args.push("[outv]".into());
 
     // Optionally include audio from the first clip's paired WAV.
-    let audio_path = clips[0]
-        .source_path
-        .with_extension("wav");
+    let audio_path = clips[0].source_path.with_extension("wav");
     if audio_path.exists() {
         args.push("-i".into());
         args.push(audio_path.to_string_lossy().into_owned());
         args.push("-map".into());
-        args.push(format!("{}:a", n)); // index after video inputs
+        args.push(format!("{}:a", n));
         args.push("-c:a".into());
         args.push("aac".into());
         args.push("-shortest".into());
@@ -125,8 +119,19 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
     args.push("libx264".into());
     args.push("-pix_fmt".into());
     args.push("yuv420p".into());
-    args.push("-y".into()); // overwrite output without asking
+    // Request progress output on stderr.
+    args.push("-progress".into());
+    args.push("pipe:2".into());
+    args.push("-y".into());
     args.push(output_path.to_string_lossy().into_owned());
+
+    Ok((ffmpeg, args))
+}
+
+/// Build and run an ffmpeg command that realises the timeline as a single
+/// output video file (synchronous / blocking).
+pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
+    let (ffmpeg, args) = build_ffmpeg_args(timeline, output_path)?;
 
     log::info!("Running: {} {}", ffmpeg, args.join(" "));
 
@@ -138,6 +143,73 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
         .context("Failed to spawn ffmpeg")?;
 
     anyhow::ensure!(status.success(), "ffmpeg exited with status {status}");
+    Ok(())
+}
+
+/// Spawn the export in a background thread, sending progress updates through
+/// a `crossbeam_channel::Sender<ExportProgress>`.
+pub fn export_timeline_async(
+    timeline: &Timeline,
+    output_path: &Path,
+    progress_tx: crossbeam_channel::Sender<ExportProgress>,
+) -> Result<()> {
+    let total_duration = timeline.total_duration();
+    let (ffmpeg, args) = build_ffmpeg_args(timeline, output_path)?;
+
+    log::info!("Running (async): {} {}", ffmpeg, args.join(" "));
+
+    let ffmpeg_owned = ffmpeg.clone();
+    let args_owned = args.clone();
+
+    std::thread::spawn(move || {
+        let mut cmd = Command::new(&ffmpeg_owned);
+        cmd.args(&args_owned);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::piped());
+        hide_console_window(&mut cmd);
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = progress_tx.send(ExportProgress::Error(format!("Failed to spawn ffmpeg: {e}")));
+                return;
+            }
+        };
+
+        let stderr = child.stderr.take().unwrap();
+        let reader = BufReader::new(stderr);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            // ffmpeg -progress outputs lines like: out_time_us=12345678
+            if let Some(time_us_str) = line.strip_prefix("out_time_us=") {
+                if let Ok(us) = time_us_str.trim().parse::<i64>() {
+                    if us >= 0 && total_duration > 0.0 {
+                        let frac = (us as f64 / 1_000_000.0 / total_duration) as f32;
+                        let _ = progress_tx.send(ExportProgress::Progress(frac.clamp(0.0, 1.0)));
+                    }
+                }
+            }
+        }
+
+        match child.wait() {
+            Ok(status) if status.success() => {
+                let _ = progress_tx.send(ExportProgress::Done);
+            }
+            Ok(status) => {
+                let _ = progress_tx.send(ExportProgress::Error(
+                    format!("ffmpeg exited with status {status}"),
+                ));
+            }
+            Err(e) => {
+                let _ = progress_tx.send(ExportProgress::Error(format!("ffmpeg wait error: {e}")));
+            }
+        }
+    });
+
     Ok(())
 }
 
