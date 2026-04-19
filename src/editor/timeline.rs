@@ -112,6 +112,66 @@ impl Timeline {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
     }
+
+    /// Remove the portion of the timeline between `cut_start` and `cut_end`.
+    ///
+    /// Clips fully inside the range are deleted. Clips partially overlapping
+    /// are trimmed (split at the boundary, then the inner part removed).
+    /// Clips after the cut are shifted left to close the gap.
+    /// Returns `true` if any material was actually removed.
+    pub fn cut_range(&mut self, cut_start: f64, cut_end: f64) -> bool {
+        if cut_end <= cut_start {
+            return false;
+        }
+        let gap = cut_end - cut_start;
+
+        // Collect ids of clips that overlap the range so we can split them.
+        let overlapping_ids: Vec<u64> = self
+            .clips
+            .iter()
+            .filter(|c| c.timeline_start < cut_end && c.timeline_end() > cut_start)
+            .map(|c| c.id)
+            .collect();
+
+        if overlapping_ids.is_empty() {
+            return false;
+        }
+
+        // Split at cut_start, then at cut_end so the region is isolated.
+        for &id in &overlapping_ids {
+            // split_clip is a no-op if the position is outside the clip.
+            self.split_clip(id, cut_start);
+        }
+        // After splitting at cut_start new clips may exist; collect fresh ids.
+        let ids_after_first_split: Vec<u64> = self
+            .clips
+            .iter()
+            .filter(|c| c.timeline_start < cut_end && c.timeline_end() > cut_start)
+            .map(|c| c.id)
+            .collect();
+        for &id in &ids_after_first_split {
+            self.split_clip(id, cut_end);
+        }
+
+        // Remove clips fully inside [cut_start, cut_end].
+        let before = self.clips.len();
+        self.clips.retain(|c| {
+            let inside = c.timeline_start >= cut_start - 1e-6
+                && c.timeline_end() <= cut_end + 1e-6;
+            !inside
+        });
+        let removed = self.clips.len() < before;
+
+        // Shift clips that start at or after cut_end to the left by gap.
+        for clip in &mut self.clips {
+            if clip.timeline_start >= cut_end - 1e-6 {
+                clip.timeline_start = (clip.timeline_start - gap).max(0.0);
+            }
+        }
+
+        self.sort_clips();
+        removed
+    }
 }
 
 #[cfg(test)]

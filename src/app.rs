@@ -22,6 +22,8 @@ const COLOR_CLIP: Color32 = Color32::from_rgb(60, 120, 200);
 const COLOR_CLIP_SELECTED: Color32 = Color32::from_rgb(90, 160, 240);
 const COLOR_PLAYHEAD: Color32 = Color32::from_rgb(250, 60, 60);
 const COLOR_RULER_TEXT: Color32 = Color32::from_rgb(180, 180, 180);
+const COLOR_TRIM_HANDLE: Color32 = Color32::from_rgb(0, 200, 130);
+const COLOR_TRIM_REGION: Color32 = Color32::from_rgba_premultiplied(0, 200, 130, 40);
 
 // ── App state ───────────────────────────────────────────────────────────────
 
@@ -51,6 +53,15 @@ pub struct FreetasiaApp {
     /// Whether the playhead handle is being dragged.
     dragging_playhead: bool,
 
+    // ── Trim heads ──
+    /// Left trim head position on the timeline (None = not placed).
+    trim_head_left: Option<f64>,
+    /// Right trim head position on the timeline (None = not placed).
+    trim_head_right: Option<f64>,
+    /// Which trim head is currently being dragged.
+    dragging_trim_left: bool,
+    dragging_trim_right: bool,
+
     // ── Scrub resolution cache ──
     /// Cached native video resolution so we don't ffprobe on every scrub.
     cached_resolution: Option<(u32, u32)>,
@@ -79,6 +90,10 @@ impl FreetasiaApp {
             dragging_clip_id: None,
             drag_offset: 0.0,
             dragging_playhead: false,
+            trim_head_left: None,
+            trim_head_right: None,
+            dragging_trim_left: false,
+            dragging_trim_right: false,
             cached_resolution: None,
             show_export_dialog: false,
             export_path: String::new(),
@@ -429,6 +444,73 @@ impl FreetasiaApp {
         self.player.seek_frame(segments, position, width, height);
     }
 
+    /// Request a scrub preview at an arbitrary timeline position (for trim heads).
+    fn request_scrub_frame_at(&mut self, position: f64) {
+        let clips = self.project.timeline.clips();
+        if clips.is_empty() || !self.ffmpeg_ok {
+            return;
+        }
+
+        let (native_w, native_h) = *self.cached_resolution.get_or_insert_with(|| {
+            clips
+                .iter()
+                .find_map(|c| crate::editor::player::probe_video_resolution(&c.source_path))
+                .unwrap_or(self.project.output_resolution)
+        });
+        let width = (native_w / 2).max(2) & !1;
+        let height = (native_h / 2).max(2) & !1;
+
+        let segments: Vec<_> = clips
+            .iter()
+            .map(|c| {
+                (
+                    c.source_path.clone(),
+                    c.trim_start,
+                    c.source_duration(),
+                    c.speed,
+                    c.timeline_start,
+                    c.duration(),
+                )
+            })
+            .collect();
+
+        self.player.seek_frame(segments, position, width, height);
+    }
+
+    /// Returns the effective trim range `(start, end)` or `None` if no trim heads are placed.
+    fn trim_range(&self) -> Option<(f64, f64)> {
+        let ph = self.project.timeline.playhead;
+        match (self.trim_head_left, self.trim_head_right) {
+            (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
+            (Some(l), None) => Some((l.min(ph), l.max(ph))),
+            (None, Some(r)) => Some((r.min(ph), r.max(ph))),
+            (None, None) => None,
+        }
+    }
+
+    /// Perform the cut operation: remove the section between the trim heads.
+    fn perform_cut(&mut self) {
+        if let Some((start, end)) = self.trim_range() {
+            if self.project.timeline.cut_range(start, end) {
+                // Clear trim heads after a successful cut.
+                self.trim_head_left = None;
+                self.trim_head_right = None;
+                self.selected_clip_id = None;
+                // Move playhead to the cut point.
+                self.project.timeline.set_playhead(start);
+                self.request_scrub_frame();
+                self.status(format!(
+                    "Cut {:.1}s of timeline ({:.2}s – {:.2}s)",
+                    end - start,
+                    start,
+                    end
+                ));
+            } else {
+                self.status("Nothing to cut in selected range");
+            }
+        }
+    }
+
     /// Invalidate cached video resolution (call when clips change).
     fn invalidate_resolution_cache(&mut self) {
         self.cached_resolution = None;
@@ -651,8 +733,32 @@ impl FreetasiaApp {
                     );
                 }
 
+                // ── Trim region highlight ─────────────────────────────
+                let handle_size = 10.0_f32;
+                let trim_handle_w = 12.0_f32;
+                let ph = self.project.timeline.playhead;
+                // Effective positions: if not set, they sit at the playhead.
+                let left_pos = self.trim_head_left.unwrap_or(ph);
+                let right_pos = self.trim_head_right.unwrap_or(ph);
+                let region_left = left_pos.min(right_pos);
+                let region_right = left_pos.max(right_pos);
+                {
+                    // Only highlight when at least one handle has been dragged away.
+                    if self.trim_head_left.is_some() || self.trim_head_right.is_some() {
+                        let rx0 = origin.x + region_left as f32 * self.zoom;
+                        let rx1 = origin.x + region_right as f32 * self.zoom;
+                        if (rx1 - rx0).abs() > 1.0 {
+                            let region_rect = Rect::from_min_max(
+                                Pos2::new(rx0, origin.y),
+                                Pos2::new(rx1, origin.y + ruler_h + track_h + 8.0),
+                            );
+                            painter.rect_filled(region_rect, 0.0, COLOR_TRIM_REGION);
+                        }
+                    }
+                }
+
                 // ── Playhead ─────────────────────────────────────────────
-                let ph_x = origin.x + self.project.timeline.playhead as f32 * self.zoom;
+                let ph_x = origin.x + ph as f32 * self.zoom;
                 // Line.
                 painter.line_segment(
                     [
@@ -661,30 +767,117 @@ impl FreetasiaApp {
                     ],
                     Stroke::new(2.0, COLOR_PLAYHEAD),
                 );
-                // Handle (downward-pointing triangle at the top of the ruler).
-                let handle_size = 8.0_f32;
+                // Handle: square with a small downward point.
                 let handle_top = origin.y;
+                let sq = handle_size * 0.8;
+                painter.rect_filled(
+                    Rect::from_center_size(
+                        Pos2::new(ph_x, handle_top + sq * 0.5),
+                        Vec2::new(sq * 2.0, sq),
+                    ),
+                    2.0,
+                    COLOR_PLAYHEAD,
+                );
+                // Small downward notch.
                 painter.add(egui::Shape::convex_polygon(
                     vec![
-                        Pos2::new(ph_x - handle_size, handle_top),
-                        Pos2::new(ph_x + handle_size, handle_top),
-                        Pos2::new(ph_x, handle_top + handle_size * 1.4),
+                        Pos2::new(ph_x - 3.0, handle_top + sq),
+                        Pos2::new(ph_x + 3.0, handle_top + sq),
+                        Pos2::new(ph_x, handle_top + sq + 5.0),
                     ],
                     COLOR_PLAYHEAD,
                     Stroke::NONE,
                 ));
 
+                // ── Trim handles (always visible) ────────────────────
+                let timeline_bottom = origin.y + ruler_h + track_h + 8.0;
+                let trim_h = handle_size * 1.5;
+                let trim_y_top = handle_top;
+
+                // Left trim handle: triangle pointing left, positioned so its
+                // right (flat) edge butts against the left edge of the center square.
+                {
+                    let lx = origin.x + left_pos as f32 * self.zoom;
+                    if self.trim_head_left.is_some() {
+                        painter.line_segment(
+                            [Pos2::new(lx, origin.y), Pos2::new(lx, timeline_bottom)],
+                            Stroke::new(1.5, COLOR_TRIM_HANDLE),
+                        );
+                    }
+                    // Flat edge at lx - sq so it never overlaps the center square.
+                    let flat_x = lx.min(ph_x - sq);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            Pos2::new(flat_x, trim_y_top),                              // top-right
+                            Pos2::new(flat_x, trim_y_top + trim_h),                     // bottom-right
+                            Pos2::new(flat_x - trim_handle_w, trim_y_top + trim_h * 0.5), // left point
+                        ],
+                        COLOR_TRIM_HANDLE,
+                        Stroke::new(1.0, Color32::WHITE),
+                    ));
+                }
+
+                // Right trim handle: triangle pointing right, positioned so its
+                // left (flat) edge butts against the right edge of the center square.
+                {
+                    let rx = origin.x + right_pos as f32 * self.zoom;
+                    if self.trim_head_right.is_some() {
+                        painter.line_segment(
+                            [Pos2::new(rx, origin.y), Pos2::new(rx, timeline_bottom)],
+                            Stroke::new(1.5, COLOR_TRIM_HANDLE),
+                        );
+                    }
+                    let flat_x = rx.max(ph_x + sq);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            Pos2::new(flat_x, trim_y_top),                               // top-left
+                            Pos2::new(flat_x, trim_y_top + trim_h),                      // bottom-left
+                            Pos2::new(flat_x + trim_handle_w, trim_y_top + trim_h * 0.5), // right point
+                        ],
+                        COLOR_TRIM_HANDLE,
+                        Stroke::new(1.0, Color32::WHITE),
+                    ));
+                }
+
                 // ── Mouse interaction ────────────────────────────────────
                 let playhead_not_playing = self.player.state() != PlaybackState::Playing;
                 let snap_threshold = 0.3_f64; // seconds
 
-                // Detect drag start: playhead handle, clip, or empty.
+                // Detect drag start: trim handles, playhead handle, clip, or empty.
                 if resp.drag_started() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         let py = pos.y - origin.y;
+                        let in_handle_y = py >= 0.0 && py <= trim_h + 4.0;
 
-                        // Check playhead handle first (generous hit area).
+                        let sq_sec = sq as f64 / self.zoom as f64;
+                        let tw_sec = trim_handle_w as f64 / self.zoom as f64;
+
+                        // Left triangle: flat edge at min(left_pos, ph - sq_sec),
+                        //   extends tw_sec further left.
+                        let l_flat = left_pos.min(ph - sq_sec);
+                        let hit_left = in_handle_y
+                            && t >= l_flat - tw_sec
+                            && t <= l_flat;
+                        // Right triangle: flat edge at max(right_pos, ph + sq_sec),
+                        //   extends tw_sec further right.
+                        let r_flat = right_pos.max(ph + sq_sec);
+                        let hit_right = in_handle_y
+                            && t >= r_flat
+                            && t <= r_flat + tw_sec;
+                        // Playhead square occupies [ph - sq_sec, ph + sq_sec].
+                        let hit_playhead = in_handle_y
+                            && t >= ph - sq_sec
+                            && t <= ph + sq_sec;
+
+                        if hit_left {
+                            self.dragging_trim_left = true;
+                        } else if hit_right {
+                            self.dragging_trim_right = true;
+                        } else if hit_playhead {
+                            self.dragging_playhead = true;
+                        // Check playhead line area below the handles.
+                        } else {
                         let ph_hit_half = (handle_size + 4.0) / self.zoom;
                         if py < ruler_h + 4.0
                             && (t - self.project.timeline.playhead).abs() < ph_hit_half as f64
@@ -706,14 +899,42 @@ impl FreetasiaApp {
                                 }
                             }
                         }
+                        }
                     }
                 }
 
-                // Dragging the playhead handle.
-                if resp.dragged() && self.dragging_playhead {
+                // Dragging a trim handle.
+                if resp.dragged() && self.dragging_trim_left {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        // Left handle cannot pass the playhead.
+                        let clamped = t.clamp(0.0, self.project.timeline.playhead);
+                        self.trim_head_left = Some(clamped);
+                        if playhead_not_playing {
+                            self.request_scrub_frame_at(clamped);
+                        }
+                    }
+                } else if resp.dragged() && self.dragging_trim_right {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        // Right handle cannot pass the playhead.
+                        let clamped = t.clamp(
+                            self.project.timeline.playhead,
+                            self.project.timeline.total_duration().max(0.0),
+                        );
+                        self.trim_head_right = Some(clamped);
+                        if playhead_not_playing {
+                            self.request_scrub_frame_at(clamped);
+                        }
+                    }
+                // Dragging the playhead handle — snap trim heads back.
+                } else if resp.dragged() && self.dragging_playhead {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         self.project.timeline.set_playhead(t);
+                        // Reset trim heads so they follow the playhead.
+                        self.trim_head_left = None;
+                        self.trim_head_right = None;
                         if playhead_not_playing {
                             self.request_scrub_frame();
                         }
@@ -804,6 +1025,9 @@ impl FreetasiaApp {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         self.project.timeline.set_playhead(t);
+                        // Reset trim heads so they follow the playhead.
+                        self.trim_head_left = None;
+                        self.trim_head_right = None;
                         if playhead_not_playing {
                             self.request_scrub_frame();
                         }
@@ -817,6 +1041,8 @@ impl FreetasiaApp {
                         self.dragging_clip_id = None;
                     }
                     self.dragging_playhead = false;
+                    self.dragging_trim_left = false;
+                    self.dragging_trim_right = false;
                 }
 
                 // Click (no drag): move playhead + select clip.
@@ -824,6 +1050,9 @@ impl FreetasiaApp {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         self.project.timeline.set_playhead(t);
+                        // Reset trim heads so they follow the playhead.
+                        self.trim_head_left = None;
+                        self.trim_head_right = None;
                         if playhead_not_playing {
                             self.request_scrub_frame();
                         }
@@ -891,6 +1120,60 @@ impl FreetasiaApp {
                 }
             });
         }
+
+        // ── Trim heads & Cut ──────────────────────────────────────────────
+        ui.separator();
+        ui.horizontal(|ui| {
+            let ph = self.project.timeline.playhead;
+            if ui
+                .button("⌊ Set Left")
+                .on_hover_text("Place left trim head at playhead")
+                .clicked()
+            {
+                self.trim_head_left = Some(ph);
+            }
+            if ui
+                .button("Set Right ⌋")
+                .on_hover_text("Place right trim head at playhead")
+                .clicked()
+            {
+                self.trim_head_right = Some(ph);
+            }
+
+            let has_range = self.trim_range().is_some();
+            if ui
+                .add_enabled(has_range, egui::Button::new("✂ Cut"))
+                .on_hover_text("Delete the section between the trim heads")
+                .clicked()
+            {
+                self.perform_cut();
+            }
+
+            if ui
+                .add_enabled(
+                    self.trim_head_left.is_some() || self.trim_head_right.is_some(),
+                    egui::Button::new("✕ Clear Trim"),
+                )
+                .on_hover_text("Remove both trim heads")
+                .clicked()
+            {
+                self.trim_head_left = None;
+                self.trim_head_right = None;
+            }
+
+            // Show current range info.
+            if let Some((start, end)) = self.trim_range() {
+                ui.label(
+                    RichText::new(format!(
+                        "  Range: {} – {} ({:.1}s)",
+                        fmt_duration(start),
+                        fmt_duration(end),
+                        end - start
+                    ))
+                    .color(COLOR_TRIM_HANDLE),
+                );
+            }
+        });
 
         // ── Zoom slider ───────────────────────────────────────────────────
         ui.horizontal(|ui| {
