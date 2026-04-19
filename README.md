@@ -1,5 +1,7 @@
 # 🎬 Freetasia
 
+<img width="1918" height="1022" alt="freetasia" src="https://github.com/user-attachments/assets/31341ddc-906a-416b-913e-d1563f5604e1" />
+
 A **free, open-source screen recorder and video editor for Windows**, inspired by Camtasia.  
 Built entirely in **Rust** using [egui](https://github.com/emilk/egui) for the UI.
 
