@@ -6,6 +6,7 @@ use crate::editor::{
     export,
     player::{PlaybackState, VideoPlayer},
     project::Project,
+    text_overlay::TextOverlay,
 };
 use crate::recorder::{
     manager::RecorderManager,
@@ -24,6 +25,8 @@ const COLOR_PLAYHEAD: Color32 = Color32::from_rgb(250, 60, 60);
 const COLOR_RULER_TEXT: Color32 = Color32::from_rgb(180, 180, 180);
 const COLOR_TRIM_HANDLE: Color32 = Color32::from_rgb(0, 200, 130);
 const COLOR_TRIM_REGION: Color32 = Color32::from_rgba_premultiplied(0, 200, 130, 40);
+const COLOR_TEXT_OVERLAY: Color32 = Color32::from_rgb(255, 200, 50);
+const COLOR_TEXT_OVERLAY_SELECTED: Color32 = Color32::from_rgb(255, 230, 100);
 
 // ── App state ───────────────────────────────────────────────────────────────
 
@@ -66,6 +69,20 @@ pub struct FreetasiaApp {
     /// Cached native video resolution so we don't ffprobe on every scrub.
     cached_resolution: Option<(u32, u32)>,
 
+    // ── Text overlays ──
+    /// Currently selected text overlay id.
+    selected_overlay_id: Option<u64>,
+    /// Dragging a text overlay body on the timeline.
+    dragging_overlay_id: Option<u64>,
+    /// Dragging the left edge of a text overlay to resize.
+    dragging_overlay_left_edge: Option<u64>,
+    /// Dragging the right edge of a text overlay to resize.
+    dragging_overlay_right_edge: Option<u64>,
+    /// Dragging a text overlay in the preview to reposition.
+    dragging_overlay_preview: bool,
+    /// Drag offset when moving an overlay body.
+    overlay_drag_offset: f64,
+
     // ── Dialogs / overlays ──
     show_export_dialog: bool,
     export_path: String,
@@ -95,6 +112,12 @@ impl FreetasiaApp {
             dragging_trim_left: false,
             dragging_trim_right: false,
             cached_resolution: None,
+            selected_overlay_id: None,
+            dragging_overlay_id: None,
+            dragging_overlay_left_edge: None,
+            dragging_overlay_right_edge: None,
+            dragging_overlay_preview: false,
+            overlay_drag_offset: 0.0,
             show_export_dialog: false,
             export_path: String::new(),
             show_about: false,
@@ -246,20 +269,123 @@ impl FreetasiaApp {
         let available = ui.available_size();
         let preview_size = Vec2::new(available.x, (available.x * 9.0 / 16.0).min(available.y - 42.0));
 
+        // Allocate the preview area with drag support (for text overlay positioning).
+        let (preview_rect, preview_resp) =
+            ui.allocate_exact_size(preview_size, Sense::click_and_drag());
+        let painter = ui.painter_at(preview_rect);
+
         if let Some(ref tex) = self.preview_texture {
-            ui.image((tex.id(), preview_size));
+            painter.image(
+                tex.id(),
+                preview_rect,
+                Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
         } else {
-            // Placeholder when no frame is available.
-            let (rect, _) =
-                ui.allocate_exact_size(preview_size, Sense::hover());
-            ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(10, 10, 10));
-            ui.painter().text(
-                rect.center(),
+            painter.rect_filled(preview_rect, 4.0, Color32::from_rgb(10, 10, 10));
+            painter.text(
+                preview_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 "No preview",
                 egui::FontId::proportional(18.0),
                 Color32::from_gray(120),
             );
+        }
+
+        // ── Draw text overlays on preview ──
+        let ph = self.project.timeline.playhead;
+        let visible_overlays: Vec<(u64, String, f32, f32, f32, [u8; 4])> = self
+            .project
+            .timeline
+            .text_overlays_at(ph)
+            .iter()
+            .map(|o| (o.id, o.text.clone(), o.x, o.y, o.font_size, o.color))
+            .collect();
+
+        for (oid, text, ox, oy, font_size, color) in &visible_overlays {
+            let px = preview_rect.min.x + ox * preview_rect.width();
+            let py = preview_rect.min.y + oy * preview_rect.height();
+            // Scale font size relative to preview height (designed for 1080p).
+            let scaled_size = font_size * preview_rect.height() / 1080.0;
+            let text_color = Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
+            let selected = self.selected_overlay_id == Some(*oid);
+
+            // Draw selection indicator.
+            if selected {
+                let galley = painter.layout_no_wrap(
+                    text.clone(),
+                    egui::FontId::proportional(scaled_size),
+                    text_color,
+                );
+                let text_rect = Rect::from_min_size(
+                    Pos2::new(px - galley.size().x * 0.5, py - galley.size().y * 0.5),
+                    galley.size(),
+                );
+                painter.rect_stroke(
+                    text_rect.expand(3.0),
+                    2.0,
+                    Stroke::new(1.5, Color32::from_rgb(255, 200, 50)),
+                );
+            }
+
+            // Draw text with a shadow for readability.
+            painter.text(
+                Pos2::new(px + 1.5, py + 1.5),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(scaled_size),
+                Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+            );
+            painter.text(
+                Pos2::new(px, py),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(scaled_size),
+                text_color,
+            );
+        }
+
+        // ── Drag text overlay in preview to reposition ──
+        if let Some(sel_id) = self.selected_overlay_id {
+            if preview_resp.drag_started() {
+                // Only start drag if the selected overlay is visible.
+                if visible_overlays.iter().any(|(oid, ..)| *oid == sel_id) {
+                    self.dragging_overlay_preview = true;
+                }
+            }
+            if preview_resp.dragged() && self.dragging_overlay_preview {
+                if let Some(pos) = preview_resp.interact_pointer_pos() {
+                    let nx = ((pos.x - preview_rect.min.x) / preview_rect.width()).clamp(0.0, 1.0);
+                    let ny = ((pos.y - preview_rect.min.y) / preview_rect.height()).clamp(0.0, 1.0);
+                    if let Some(overlay) = self.project.timeline.text_overlay_mut(sel_id) {
+                        overlay.x = nx;
+                        overlay.y = ny;
+                    }
+                }
+            }
+            if preview_resp.drag_stopped() {
+                self.dragging_overlay_preview = false;
+            }
+            // Click on preview to select overlay under cursor.
+            if preview_resp.clicked() {
+                if let Some(pos) = preview_resp.interact_pointer_pos() {
+                    let nx = (pos.x - preview_rect.min.x) / preview_rect.width();
+                    let ny = (pos.y - preview_rect.min.y) / preview_rect.height();
+                    // Find the closest visible overlay to the click.
+                    let mut best: Option<u64> = None;
+                    let mut best_dist = 0.05_f32; // threshold in normalized coords
+                    for (oid, _, ox, oy, ..) in &visible_overlays {
+                        let d = ((nx - ox).powi(2) + (ny - oy).powi(2)).sqrt();
+                        if d < best_dist {
+                            best_dist = d;
+                            best = Some(*oid);
+                        }
+                    }
+                    if let Some(id) = best {
+                        self.selected_overlay_id = Some(id);
+                    }
+                }
+            }
         }
 
         // ── Playback transport ──
@@ -669,7 +795,10 @@ impl FreetasiaApp {
     fn draw_timeline(&mut self, ui: &mut egui::Ui) {
         let total_dur = self.project.timeline.total_duration().max(30.0);
         let track_h = 40.0;
+        let text_track_h = 30.0;
+        let track_gap = 2.0;
         let ruler_h = 20.0;
+        let total_h = ruler_h + track_h + track_gap + text_track_h + 8.0;
 
         let available_w = ui.available_width();
 
@@ -678,7 +807,7 @@ impl FreetasiaApp {
             .show(ui, |ui| {
                 let content_w = (total_dur as f32 * self.zoom).max(available_w);
                 let (rect, resp) = ui.allocate_exact_size(
-                    Vec2::new(content_w, ruler_h + track_h + 8.0),
+                    Vec2::new(content_w, total_h),
                     Sense::click_and_drag(),
                 );
 
@@ -733,6 +862,76 @@ impl FreetasiaApp {
                     );
                 }
 
+                // ── Text overlay track ───────────────────────────────
+                let text_track_top = track_top + track_h + track_gap;
+                // Track label.
+                painter.text(
+                    Pos2::new(origin.x + 4.0, text_track_top + 2.0),
+                    egui::Align2::LEFT_TOP,
+                    "T",
+                    egui::FontId::monospace(10.0),
+                    Color32::from_gray(90),
+                );
+                // Separator line between tracks.
+                painter.line_segment(
+                    [
+                        Pos2::new(origin.x, text_track_top - 1.0),
+                        Pos2::new(origin.x + content_w, text_track_top - 1.0),
+                    ],
+                    Stroke::new(1.0, Color32::from_gray(50)),
+                );
+
+                let edge_grab_w = 6.0_f32;
+                for overlay in self.project.timeline.text_overlays() {
+                    let ox0 = origin.x + overlay.start as f32 * self.zoom;
+                    let ox1 = origin.x + overlay.end as f32 * self.zoom;
+                    let overlay_rect = Rect::from_min_max(
+                        Pos2::new(ox0, text_track_top),
+                        Pos2::new(ox1.max(ox0 + 4.0), text_track_top + text_track_h),
+                    );
+
+                    let selected = self.selected_overlay_id == Some(overlay.id);
+                    let fill = if selected { COLOR_TEXT_OVERLAY_SELECTED } else { COLOR_TEXT_OVERLAY };
+                    painter.rect_filled(overlay_rect, 3.0, fill);
+                    painter.rect_stroke(overlay_rect, 3.0, Stroke::new(1.0, Color32::from_gray(180)));
+
+                    // Draw resize handles (small bars on edges).
+                    let edge_color = Color32::from_gray(60);
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(ox0, text_track_top),
+                            Vec2::new(edge_grab_w.min((ox1 - ox0) * 0.3), text_track_h),
+                        ),
+                        2.0,
+                        edge_color,
+                    );
+                    painter.rect_filled(
+                        Rect::from_min_size(
+                            Pos2::new(ox1 - edge_grab_w.min((ox1 - ox0) * 0.3), text_track_top),
+                            Vec2::new(edge_grab_w.min((ox1 - ox0) * 0.3), text_track_h),
+                        ),
+                        2.0,
+                        edge_color,
+                    );
+
+                    // Text label inside the block.
+                    let clip_w = ox1 - ox0;
+                    if clip_w > 20.0 {
+                        let label = if overlay.text.len() > 20 {
+                            format!("{}…", &overlay.text[..19])
+                        } else {
+                            overlay.text.clone()
+                        };
+                        painter.text(
+                            Pos2::new(ox0 + edge_grab_w + 2.0, text_track_top + 3.0),
+                            egui::Align2::LEFT_TOP,
+                            label,
+                            egui::FontId::proportional(11.0),
+                            Color32::BLACK,
+                        );
+                    }
+                }
+
                 // ── Trim region highlight ─────────────────────────────
                 let handle_size = 10.0_f32;
                 let trim_handle_w = 12.0_f32;
@@ -750,7 +949,7 @@ impl FreetasiaApp {
                         if (rx1 - rx0).abs() > 1.0 {
                             let region_rect = Rect::from_min_max(
                                 Pos2::new(rx0, origin.y),
-                                Pos2::new(rx1, origin.y + ruler_h + track_h + 8.0),
+                                Pos2::new(rx1, origin.y + total_h),
                             );
                             painter.rect_filled(region_rect, 0.0, COLOR_TRIM_REGION);
                         }
@@ -763,7 +962,7 @@ impl FreetasiaApp {
                 painter.line_segment(
                     [
                         Pos2::new(ph_x, origin.y),
-                        Pos2::new(ph_x, origin.y + ruler_h + track_h + 8.0),
+                        Pos2::new(ph_x, origin.y + total_h),
                     ],
                     Stroke::new(2.0, COLOR_PLAYHEAD),
                 );
@@ -790,7 +989,7 @@ impl FreetasiaApp {
                 ));
 
                 // ── Trim handles (always visible) ────────────────────
-                let timeline_bottom = origin.y + ruler_h + track_h + 8.0;
+                let timeline_bottom = origin.y + total_h;
                 let trim_h = handle_size * 1.5;
                 let trim_y_top = handle_top;
 
@@ -896,6 +1095,30 @@ impl FreetasiaApp {
                                     self.dragging_clip_id = Some(clip.id);
                                     self.drag_offset = t - clip.timeline_start;
                                     self.selected_clip_id = Some(clip.id);
+                                }
+                            }
+                            // Text overlay track hit testing.
+                            let text_py = pos.y - (origin.y + ruler_h + 4.0 + track_h + track_gap);
+                            if text_py >= 0.0 && text_py <= text_track_h {
+                                let edge_sec = edge_grab_w as f64 / self.zoom as f64;
+                                if let Some(overlay) = self
+                                    .project
+                                    .timeline
+                                    .text_overlays()
+                                    .iter()
+                                    .find(|o| t >= o.start && t <= o.end)
+                                {
+                                    let oid = overlay.id;
+                                    // Check if clicking on left or right resize edge.
+                                    if t <= overlay.start + edge_sec {
+                                        self.dragging_overlay_left_edge = Some(oid);
+                                    } else if t >= overlay.end - edge_sec {
+                                        self.dragging_overlay_right_edge = Some(oid);
+                                    } else {
+                                        self.dragging_overlay_id = Some(oid);
+                                        self.overlay_drag_offset = t - overlay.start;
+                                    }
+                                    self.selected_overlay_id = Some(oid);
                                 }
                             }
                         }
@@ -1020,6 +1243,38 @@ impl FreetasiaApp {
                             clip.timeline_start = clamped_start;
                         }
                     }
+                // Dragging a text overlay body.
+                } else if resp.dragged() && self.dragging_overlay_id.is_some() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        let new_start = (t - self.overlay_drag_offset).max(0.0);
+                        let oid = self.dragging_overlay_id.unwrap();
+                        if let Some(overlay) = self.project.timeline.text_overlay_mut(oid) {
+                            let dur = overlay.end - overlay.start;
+                            overlay.start = new_start;
+                            overlay.end = new_start + dur;
+                        }
+                    }
+                // Dragging left edge of a text overlay to resize.
+                } else if resp.dragged() && self.dragging_overlay_left_edge.is_some() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        let oid = self.dragging_overlay_left_edge.unwrap();
+                        if let Some(overlay) = self.project.timeline.text_overlay_mut(oid) {
+                            let new_start = t.clamp(0.0, overlay.end - 0.1);
+                            overlay.start = new_start;
+                        }
+                    }
+                // Dragging right edge of a text overlay to resize.
+                } else if resp.dragged() && self.dragging_overlay_right_edge.is_some() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let t = ((pos.x - origin.x) / self.zoom) as f64;
+                        let oid = self.dragging_overlay_right_edge.unwrap();
+                        if let Some(overlay) = self.project.timeline.text_overlay_mut(oid) {
+                            let new_end = t.max(overlay.start + 0.1);
+                            overlay.end = new_end;
+                        }
+                    }
                 } else if resp.dragged() {
                     // Not dragging clip or playhead → scrub the playhead.
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -1043,6 +1298,9 @@ impl FreetasiaApp {
                     self.dragging_playhead = false;
                     self.dragging_trim_left = false;
                     self.dragging_trim_right = false;
+                    self.dragging_overlay_id = None;
+                    self.dragging_overlay_left_edge = None;
+                    self.dragging_overlay_right_edge = None;
                 }
 
                 // Click (no drag): move playhead + select clip.
@@ -1067,6 +1325,17 @@ impl FreetasiaApp {
                                     t >= c.timeline_start && t <= c.timeline_end()
                                 })
                                 .map(|c| c.id);
+                        }
+                        // Click on text track: select overlay.
+                        let text_py = pos.y - (origin.y + ruler_h + 4.0 + track_h + track_gap);
+                        if text_py >= 0.0 && text_py <= text_track_h {
+                            self.selected_overlay_id = self
+                                .project
+                                .timeline
+                                .text_overlays()
+                                .iter()
+                                .find(|o| t >= o.start && t <= o.end)
+                                .map(|o| o.id);
                         }
                     }
                 }
@@ -1174,6 +1443,93 @@ impl FreetasiaApp {
                 );
             }
         });
+
+        // ── Text overlay controls ────────────────────────────────────────
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .button("🔤 Add Text")
+                .on_hover_text("Add a text callout at the playhead")
+                .clicked()
+            {
+                let ph = self.project.timeline.playhead;
+                let overlay = TextOverlay::new(0, "Text", ph, ph + 3.0);
+                let id = self.project.timeline.add_text_overlay(overlay);
+                self.selected_overlay_id = Some(id);
+                self.status("Text overlay added");
+            }
+
+            if let Some(sel_id) = self.selected_overlay_id {
+                if ui.button("🗑 Delete Text").clicked() {
+                    self.project.timeline.remove_text_overlay(sel_id);
+                    self.selected_overlay_id = None;
+                }
+            }
+        });
+
+        // ── Text overlay inspector ────────────────────────────────────────
+        if let Some(sel_id) = self.selected_overlay_id {
+            if self.project.timeline.text_overlay_mut(sel_id).is_some() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Text:");
+                    let tl = &mut self.project.timeline;
+                    if let Some(overlay) = tl.text_overlay_mut(sel_id) {
+                        ui.text_edit_singleline(&mut overlay.text);
+                        ui.label("  Start:");
+                        ui.add(
+                            egui::DragValue::new(&mut overlay.start)
+                                .speed(0.1)
+                                .clamp_range(0.0..=overlay.end - 0.1)
+                                .suffix("s"),
+                        );
+                        ui.label("  End:");
+                        ui.add(
+                            egui::DragValue::new(&mut overlay.end)
+                                .speed(0.1)
+                                .clamp_range((overlay.start + 0.1)..=f64::MAX)
+                                .suffix("s"),
+                        );
+                        ui.label("  Size:");
+                        ui.add(
+                            egui::DragValue::new(&mut overlay.font_size)
+                                .speed(1.0)
+                                .clamp_range(8.0..=200.0)
+                                .suffix("px"),
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Position:");
+                    let tl = &mut self.project.timeline;
+                    if let Some(overlay) = tl.text_overlay_mut(sel_id) {
+                        ui.label("X:");
+                        ui.add(
+                            egui::DragValue::new(&mut overlay.x)
+                                .speed(0.01)
+                                .clamp_range(0.0..=1.0),
+                        );
+                        ui.label("Y:");
+                        ui.add(
+                            egui::DragValue::new(&mut overlay.y)
+                                .speed(0.01)
+                                .clamp_range(0.0..=1.0),
+                        );
+                        ui.label("  Color:");
+                        let mut color = egui::Color32::from_rgba_unmultiplied(
+                            overlay.color[0],
+                            overlay.color[1],
+                            overlay.color[2],
+                            overlay.color[3],
+                        );
+                        if ui.color_edit_button_srgba(&mut color).changed() {
+                            overlay.color = [color.r(), color.g(), color.b(), color.a()];
+                        }
+                    }
+                    ui.label("  (Drag text in preview to reposition)");
+                });
+            }
+        }
 
         // ── Zoom slider ───────────────────────────────────────────────────
         ui.horizontal(|ui| {

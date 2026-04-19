@@ -61,7 +61,46 @@ pub fn export_timeline(timeline: &Timeline, output_path: &Path) -> Result<()> {
     for i in 0..n {
         filter.push_str(&format!("[v{i}]"));
     }
-    filter.push_str(&format!("concat=n={n}:v=1:a=0[outv]"));
+    filter.push_str(&format!("concat=n={n}:v=1:a=0[concatv]"));
+
+    // Apply text overlays using drawtext filters.
+    let overlays = timeline.text_overlays();
+    if overlays.is_empty() {
+        filter.push_str(";[concatv]null[outv]");
+    } else {
+        let mut prev_label = "concatv".to_string();
+        for (i, overlay) in overlays.iter().enumerate() {
+            let next_label = if i == overlays.len() - 1 {
+                "outv".to_string()
+            } else {
+                format!("txt{i}")
+            };
+            // Escape special characters for ffmpeg drawtext.
+            let escaped_text = overlay
+                .text
+                .replace('\\', "\\\\\\\\")
+                .replace('\'', "'\\\\\\''")
+                .replace(':', "\\\\:");
+            let r = overlay.color[0];
+            let g = overlay.color[1];
+            let b = overlay.color[2];
+            let a = overlay.color[3];
+            let fontcolor = format!("#{r:02x}{g:02x}{b:02x}{a:02x}");
+            // Position: x/y are fractions of video size.
+            let x_expr = format!("w*{}-tw/2", overlay.x);
+            let y_expr = format!("h*{}-th/2", overlay.y);
+            filter.push_str(&format!(
+                ";[{prev_label}]drawtext=text='{escaped_text}'\
+                 :fontsize={fs}:fontcolor={fontcolor}\
+                 :x='{x_expr}':y='{y_expr}'\
+                 :enable='between(t,{start},{end})'[{next_label}]",
+                fs = overlay.font_size as u32,
+                start = overlay.start,
+                end = overlay.end,
+            ));
+            prev_label = next_label;
+        }
+    }
 
     args.push("-filter_complex".into());
     args.push(filter);

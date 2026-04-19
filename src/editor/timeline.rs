@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 use super::clip::Clip;
+use super::text_overlay::TextOverlay;
 
 /// Manages the ordered collection of clips and the playhead position.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Timeline {
     clips: Vec<Clip>,
+    #[serde(default)]
+    text_overlays: Vec<TextOverlay>,
     next_id: u64,
     /// Current playhead position in seconds.
     pub playhead: f64,
@@ -111,6 +114,39 @@ impl Timeline {
                 .partial_cmp(&b.timeline_start)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+    }
+
+    // ── Text overlays ────────────────────────────────────────────────────
+
+    /// Add a text overlay and return its assigned id.
+    pub fn add_text_overlay(&mut self, mut overlay: TextOverlay) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        overlay.id = id;
+        self.text_overlays.push(overlay);
+        id
+    }
+
+    /// Remove a text overlay by id. Returns `true` if found.
+    pub fn remove_text_overlay(&mut self, id: u64) -> bool {
+        let before = self.text_overlays.len();
+        self.text_overlays.retain(|o| o.id != id);
+        self.text_overlays.len() < before
+    }
+
+    /// Return an immutable slice of all text overlays.
+    pub fn text_overlays(&self) -> &[TextOverlay] {
+        &self.text_overlays
+    }
+
+    /// Return a mutable reference to a text overlay by id.
+    pub fn text_overlay_mut(&mut self, id: u64) -> Option<&mut TextOverlay> {
+        self.text_overlays.iter_mut().find(|o| o.id == id)
+    }
+
+    /// Return all text overlays visible at the given timeline position.
+    pub fn text_overlays_at(&self, t: f64) -> Vec<&TextOverlay> {
+        self.text_overlays.iter().filter(|o| o.visible_at(t)).collect()
     }
 
     /// Remove the portion of the timeline between `cut_start` and `cut_end`.
