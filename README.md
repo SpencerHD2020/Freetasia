@@ -134,4 +134,3 @@ MIT
 
 ## TODO:
 Silence Audio from specific clip      
-Blur Video in specific clip

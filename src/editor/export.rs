@@ -61,39 +61,79 @@ fn build_ffmpeg_args(timeline: &Timeline, output_path: &Path) -> Result<(String,
     }
     filter.push_str(&format!("concat=n={n}:v=1:a=0[concatv]"));
 
-    // Apply text overlays using drawtext filters.
-    let overlays = timeline.text_overlays();
-    if overlays.is_empty() {
-        filter.push_str(";[concatv]null[outv]");
+    // Apply overlays: text (drawtext), then blur (split+crop+boxblur+overlay).
+    use super::overlay::OverlayKind;
+    let all_overlays = timeline.overlays();
+    let text_overlays: Vec<_> = all_overlays.iter().filter(|o| o.is_text()).collect();
+    let blur_overlays: Vec<_> = all_overlays.iter().filter(|o| o.is_blur()).collect();
+    let after_text_label = if blur_overlays.is_empty() { "outv" } else { "textv" };
+
+    if text_overlays.is_empty() {
+        filter.push_str(&format!(";[concatv]null[{after_text_label}]"));
     } else {
         let mut prev_label = "concatv".to_string();
-        for (i, overlay) in overlays.iter().enumerate() {
-            let next_label = if i == overlays.len() - 1 {
-                "outv".to_string()
+        for (i, overlay) in text_overlays.iter().enumerate() {
+            let next_label = if i == text_overlays.len() - 1 {
+                after_text_label.to_string()
             } else {
                 format!("txt{i}")
             };
-            let escaped_text = overlay
-                .text
-                .replace('\\', "\\\\\\\\")
-                .replace('\'', "'\\\\\\''")
-                .replace(':', "\\\\:");
-            let r = overlay.color[0];
-            let g = overlay.color[1];
-            let b = overlay.color[2];
-            let a = overlay.color[3];
-            let fontcolor = format!("#{r:02x}{g:02x}{b:02x}{a:02x}");
-            let x_expr = format!("w*{}-tw/2", overlay.x);
-            let y_expr = format!("h*{}-th/2", overlay.y);
-            filter.push_str(&format!(
-                ";[{prev_label}]drawtext=text='{escaped_text}'\
-                 :fontsize={fs}:fontcolor={fontcolor}\
-                 :x='{x_expr}':y='{y_expr}'\
-                 :enable='between(t,{start},{end})'[{next_label}]",
-                fs = overlay.font_size as u32,
-                start = overlay.start,
-                end = overlay.end,
-            ));
+            if let OverlayKind::Text { ref text, font_size, color } = overlay.kind {
+                let escaped_text = text
+                    .replace('\\', "\\\\\\\\")
+                    .replace('\'', "'\\\\\\''")
+                    .replace(':', "\\\\:");
+                let r = color[0];
+                let g = color[1];
+                let b = color[2];
+                let a = color[3];
+                let fontcolor = format!("#{r:02x}{g:02x}{b:02x}{a:02x}");
+                let x_expr = format!("w*{}-tw/2", overlay.x);
+                let y_expr = format!("h*{}-th/2", overlay.y);
+                filter.push_str(&format!(
+                    ";[{prev_label}]drawtext=text='{escaped_text}'\
+                     :fontsize={fs}:fontcolor={fontcolor}\
+                     :x='{x_expr}':y='{y_expr}'\
+                     :enable='between(t,{start},{end})'[{next_label}]",
+                    fs = font_size as u32,
+                    start = overlay.start,
+                    end = overlay.end,
+                ));
+            }
+            prev_label = next_label;
+        }
+    }
+
+    // Apply blur overlays using split → crop → boxblur → overlay.
+    if !blur_overlays.is_empty() {
+        let mut prev_label = after_text_label.to_string();
+        for (i, blur) in blur_overlays.iter().enumerate() {
+            let next_label = if i == blur_overlays.len() - 1 {
+                "outv".to_string()
+            } else {
+                format!("blr{i}")
+            };
+            if let OverlayKind::Blur { width, height } = &blur.kind {
+                filter.push_str(&format!(
+                    ";[{prev_label}]split=2[bbase{i}][bsrc{i}]\
+                     ;[bsrc{i}]crop=\
+                     floor(iw*{w}/2)*2:floor(ih*{h}/2)*2:\
+                     floor(iw*{x}):floor(ih*{y})\
+                     ,boxblur=8:5\
+                     :enable='between(t,{start},{end})'\
+                     ,format=yuv420p\
+                     [bblur{i}]\
+                     ;[bbase{i}][bblur{i}]overlay=\
+                     floor(W*{x}):floor(H*{y})\
+                     :shortest=1[{next_label}]",
+                    w = width,
+                    h = height,
+                    x = blur.x,
+                    y = blur.y,
+                    start = blur.start,
+                    end = blur.end,
+                ));
+            }
             prev_label = next_label;
         }
     }
@@ -179,6 +219,8 @@ pub fn export_timeline_async(
         let stderr = child.stderr.take().unwrap();
         let reader = BufReader::new(stderr);
 
+        let mut last_error_lines: Vec<String> = Vec::new();
+
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
@@ -192,6 +234,12 @@ pub fn export_timeline_async(
                         let _ = progress_tx.send(ExportProgress::Progress(frac.clamp(0.0, 1.0)));
                     }
                 }
+            } else if !line.trim().is_empty() {
+                // Keep last few non-progress lines for error reporting.
+                last_error_lines.push(line);
+                if last_error_lines.len() > 20 {
+                    last_error_lines.remove(0);
+                }
             }
         }
 
@@ -200,8 +248,13 @@ pub fn export_timeline_async(
                 let _ = progress_tx.send(ExportProgress::Done);
             }
             Ok(status) => {
+                let detail = if last_error_lines.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", last_error_lines.join("\n"))
+                };
                 let _ = progress_tx.send(ExportProgress::Error(
-                    format!("ffmpeg exited with status {status}"),
+                    format!("ffmpeg exited with status {status}{detail}"),
                 ));
             }
             Err(e) => {
