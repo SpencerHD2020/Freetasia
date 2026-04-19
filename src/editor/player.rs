@@ -84,6 +84,13 @@ pub struct VideoPlayer {
     scrub_pending: Option<ScrubRequest>,
 }
 
+impl VideoPlayer {
+    /// Returns `true` when a scrub decode is in flight or pending.
+    pub fn is_scrub_busy(&self) -> bool {
+        self.scrub_busy || self.scrub_pending.is_some()
+    }
+}
+
 impl Default for VideoPlayer {
     fn default() -> Self {
         Self {
@@ -499,14 +506,14 @@ fn decode_single_frame(
         }
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-ss", &format!("{seek_pos:.3}")])
+        cmd.args(["-noaccurate_seek", "-ss", &format!("{seek_pos:.3}")])
             .arg("-i")
             .arg(source_path)
             .args([
                 "-frames:v",
                 "1",
                 "-vf",
-                &format!("scale={width}:{height}:flags=bilinear"),
+                &format!("scale={width}:{height}:flags=fast_bilinear"),
                 "-f",
                 "rawvideo",
                 "-pix_fmt",

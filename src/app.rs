@@ -51,6 +51,10 @@ pub struct FreetasiaApp {
     /// Whether the playhead handle is being dragged.
     dragging_playhead: bool,
 
+    // ── Scrub resolution cache ──
+    /// Cached native video resolution so we don't ffprobe on every scrub.
+    cached_resolution: Option<(u32, u32)>,
+
     // ── Dialogs / overlays ──
     show_export_dialog: bool,
     export_path: String,
@@ -75,6 +79,7 @@ impl FreetasiaApp {
             dragging_clip_id: None,
             drag_offset: 0.0,
             dragging_playhead: false,
+            cached_resolution: None,
             show_export_dialog: false,
             export_path: String::new(),
             show_about: false,
@@ -99,9 +104,10 @@ impl eframe::App for FreetasiaApp {
         // Pull scrub preview frame when not playing.
         self.refresh_scrub_preview(ctx);
 
-        // Keep repainting while recording or playing.
+        // Keep repainting while recording, playing, or waiting for a scrub frame.
         if self.recorder.state() == RecordingState::Recording
             || self.player.state() == PlaybackState::Playing
+            || self.player.is_scrub_busy()
         {
             ctx.request_repaint();
         }
@@ -133,6 +139,7 @@ impl FreetasiaApp {
                 if ui.button("📄 New").on_hover_text("New project").clicked() {
                     self.project = Project::default();
                     self.selected_clip_id = None;
+                    self.invalidate_resolution_cache();
                     self.status("New project created");
                 }
 
@@ -393,10 +400,16 @@ impl FreetasiaApp {
             return;
         }
 
-        let (width, height) = clips
-            .iter()
-            .find_map(|c| crate::editor::player::probe_video_resolution(&c.source_path))
-            .unwrap_or(self.project.output_resolution);
+        // Use cached resolution to avoid spawning ffprobe on every scrub event.
+        let (native_w, native_h) = *self.cached_resolution.get_or_insert_with(|| {
+            clips
+                .iter()
+                .find_map(|c| crate::editor::player::probe_video_resolution(&c.source_path))
+                .unwrap_or(self.project.output_resolution)
+        });
+        // Halve resolution for scrub preview – 4× fewer pixels to decode.
+        let width = (native_w / 2).max(2) & !1;  // keep even
+        let height = (native_h / 2).max(2) & !1;
 
         let segments: Vec<_> = clips
             .iter()
@@ -414,6 +427,11 @@ impl FreetasiaApp {
 
         let position = self.project.timeline.playhead;
         self.player.seek_frame(segments, position, width, height);
+    }
+
+    /// Invalidate cached video resolution (call when clips change).
+    fn invalidate_resolution_cache(&mut self) {
+        self.cached_resolution = None;
     }
 
     // ── Recording controls ──────────────────────────────────────────────────
@@ -869,6 +887,7 @@ impl FreetasiaApp {
                 if ui.button("🗑 Delete").clicked() {
                     self.project.timeline.remove_clip(sel_id);
                     self.selected_clip_id = None;
+                    self.invalidate_resolution_cache();
                 }
             });
         }
@@ -950,6 +969,7 @@ impl FreetasiaApp {
             let clip = Clip::new(0, session.video_path, dur, label);
             let id = self.project.timeline.add_clip(clip);
             self.selected_clip_id = Some(id);
+            self.invalidate_resolution_cache();
             self.status(format!("Recording added to timeline ({:.1}s)", dur));
         }
     }
@@ -973,6 +993,7 @@ impl FreetasiaApp {
             Ok(p) => {
                 self.project = p;
                 self.selected_clip_id = None;
+                self.invalidate_resolution_cache();
                 self.status(format!("Opened {}", path.display()));
             }
             Err(e) => self.status(format!("Open failed: {e}")),
