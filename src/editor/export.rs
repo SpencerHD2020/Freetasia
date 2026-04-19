@@ -214,21 +214,44 @@ pub fn export_timeline_async(
 }
 
 /// Return the path to the ffmpeg executable, searching common locations.
+///
+/// Search order:
+/// 1. Bundled `ffmpeg.exe` next to the running executable (for distribution).
+/// 2. System `PATH`.
+/// 3. Common Windows install location `C:\ffmpeg\bin\`.
 pub fn find_ffmpeg() -> Result<String> {
-    // Try plain name first (on PATH).
+    // 1. Check next to our own executable (bundled distribution).
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let bundled = exe_dir.join("ffmpeg.exe");
+            if bundled.exists() {
+                return Ok(bundled.to_string_lossy().into_owned());
+            }
+            // Also check an `ffmpeg/` subdirectory next to the exe.
+            let subdir = exe_dir.join("ffmpeg").join("ffmpeg.exe");
+            if subdir.exists() {
+                return Ok(subdir.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // 2. Try plain name (on PATH).
     let mut probe = Command::new("ffmpeg");
     probe.arg("-version");
     hide_console_window(&mut probe);
     if probe.output().is_ok() {
         return Ok("ffmpeg".into());
     }
-    // Common Windows install location.
+
+    // 3. Common Windows install location.
     let win_path = r"C:\ffmpeg\bin\ffmpeg.exe";
     if Path::new(win_path).exists() {
         return Ok(win_path.into());
     }
+
     anyhow::bail!(
-        "ffmpeg not found. Please install ffmpeg and add it to your PATH. \
+        "ffmpeg not found. Place ffmpeg.exe next to the Freetasia executable, \
+         or install ffmpeg and add it to your PATH. \
          See https://ffmpeg.org/download.html"
     )
 }

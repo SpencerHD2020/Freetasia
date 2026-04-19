@@ -26,9 +26,9 @@ Built entirely in **Rust** using [egui](https://github.com/emilk/egui) for the U
 | Dependency | Purpose |
 |---|---|
 | [Rust ≥ 1.75](https://rustup.rs/) | Build toolchain |
-| [ffmpeg](https://ffmpeg.org/download.html) on `PATH` | Video encoding & export |
+| [ffmpeg](https://ffmpeg.org/download.html) | Video encoding & export |
 
-> On Windows, download an ffmpeg release build, extract it, and add the `bin/` folder to your `PATH`.
+> **Note:** ffmpeg is automatically detected if placed next to `freetasia.exe`, on your system `PATH`, or at `C:\ffmpeg\bin\`. See [Distributing](#distributing) for how to bundle everything together.
 
 ---
 
@@ -95,6 +95,34 @@ Hardware-dependent tests (screen capture, audio) are marked `#[ignore]` and can 
 ```powershell
 cargo test -- --ignored
 ```
+
+---
+
+## Distributing
+
+To create a self-contained bundle that works on machines **without** ffmpeg installed:
+
+```powershell
+.\scripts\bundle.ps1
+```
+
+This will:
+1. Build Freetasia in release mode.
+2. Download a pre-built ffmpeg (LGPL) from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds).
+3. Assemble everything into `dist/Freetasia/` — just zip and share.
+
+The resulting folder contains:
+```
+dist/Freetasia/
+├── freetasia.exe          # The app
+├── ffmpeg.exe             # Bundled ffmpeg
+├── ffprobe.exe            # Bundled ffprobe
+├── *.dll                  # ffmpeg shared libraries
+├── README.md
+└── THIRD_PARTY_LICENSES.md
+```
+
+> ffmpeg is distributed under the LGPL 2.1. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for details.
 
 ---
 
