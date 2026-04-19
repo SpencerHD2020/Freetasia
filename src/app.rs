@@ -893,7 +893,7 @@ impl FreetasiaApp {
                     Stroke::new(1.0, Color32::from_gray(50)),
                 );
 
-                let edge_grab_w = 12.0_f32;
+                let edge_grab_w = 16.0_f32;
                 for overlay in self.project.timeline.text_overlays() {
                     let ox0 = origin.x + overlay.start as f32 * self.zoom;
                     let ox1 = origin.x + overlay.end as f32 * self.zoom;
@@ -908,7 +908,7 @@ impl FreetasiaApp {
                     painter.rect_stroke(overlay_rect, 3.0, Stroke::new(1.0, Color32::from_gray(180)));
 
                     // Draw resize handles on edges — visible grab bars.
-                    let handle_visual_w = edge_grab_w.min((ox1 - ox0) * 0.35);
+                    let handle_visual_w = edge_grab_w.min((ox1 - ox0) * 0.4);
                     let handle_color = if selected {
                         Color32::from_rgb(200, 140, 0)
                     } else {
@@ -1088,81 +1088,107 @@ impl FreetasiaApp {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let t = ((pos.x - origin.x) / self.zoom) as f64;
                         let py = pos.y - origin.y;
-                        let in_handle_y = py >= 0.0 && py <= trim_h + 4.0;
+                        // Generous vertical zone for the handle row — covers
+                        // the ruler + some slack so you don't need pixel-perfect Y.
+                        let in_handle_y = py >= -4.0 && py <= ruler_h + 6.0;
 
                         let sq_sec = sq as f64 / self.zoom as f64;
                         let tw_sec = trim_handle_w as f64 / self.zoom as f64;
 
-                        // Left triangle: flat edge at min(left_pos, ph - sq_sec),
-                        //   extends tw_sec further left.
+                        // Compute the visual center of each handle (in timeline seconds).
                         let l_flat = left_pos.min(ph - sq_sec);
-                        let hit_left = in_handle_y
-                            && t >= l_flat - tw_sec
-                            && t <= l_flat;
-                        // Right triangle: flat edge at max(right_pos, ph + sq_sec),
-                        //   extends tw_sec further right.
+                        let left_center = l_flat - tw_sec * 0.5;
                         let r_flat = right_pos.max(ph + sq_sec);
-                        let hit_right = in_handle_y
-                            && t >= r_flat
-                            && t <= r_flat + tw_sec;
-                        // Playhead square occupies [ph - sq_sec, ph + sq_sec].
-                        let hit_playhead = in_handle_y
-                            && t >= ph - sq_sec
-                            && t <= ph + sq_sec;
+                        let right_center = r_flat + tw_sec * 0.5;
+                        let playhead_center = ph;
 
-                        if hit_left {
-                            self.dragging_trim_left = true;
-                        } else if hit_right {
-                            self.dragging_trim_right = true;
-                        } else if hit_playhead {
-                            self.dragging_playhead = true;
-                        // Check playhead line area below the handles.
-                        } else {
-                        let ph_hit_half = (handle_size + 4.0) / self.zoom;
-                        if py < ruler_h + 4.0
-                            && (t - self.project.timeline.playhead).abs() < ph_hit_half as f64
-                        {
-                            self.dragging_playhead = true;
-                        } else {
-                            let clip_py = pos.y - (origin.y + ruler_h);
-                            if clip_py >= 0.0 && clip_py <= track_h {
-                                if let Some(clip) = self
-                                    .project
-                                    .timeline
-                                    .clips()
-                                    .iter()
-                                    .find(|c| t >= c.timeline_start && t <= c.timeline_end())
-                                {
-                                    self.dragging_clip_id = Some(clip.id);
-                                    self.drag_offset = t - clip.timeline_start;
-                                    self.selected_clip_id = Some(clip.id);
+                        // Maximum grab radius — generous enough that the whole
+                        // cluster of three handles is always reachable.
+                        let grab_radius = (sq + trim_handle_w + 10.0) as f64 / self.zoom as f64;
+
+                        // In the handle row, resolve by nearest-center distance
+                        // so you always get the closest handle, not a strict boundary.
+                        let mut handle_hit = false;
+                        if in_handle_y {
+                            let d_left = (t - left_center).abs();
+                            let d_right = (t - right_center).abs();
+                            let d_ph = (t - playhead_center).abs();
+                            let min_d = d_left.min(d_right).min(d_ph);
+
+                            if min_d <= grab_radius {
+                                handle_hit = true;
+                                if min_d == d_left {
+                                    self.dragging_trim_left = true;
+                                } else if min_d == d_right {
+                                    self.dragging_trim_right = true;
+                                } else {
+                                    self.dragging_playhead = true;
                                 }
                             }
-                            // Text overlay track hit testing.
+                        }
+
+                        if !handle_hit {
+                            // Text overlay track hit testing — check first so
+                            // edge grabs aren't swallowed by the general scrub.
                             let text_py = pos.y - (origin.y + ruler_h + 4.0 + track_h + track_gap);
-                            if text_py >= 0.0 && text_py <= text_track_h {
-                                let edge_sec = edge_grab_w as f64 / self.zoom as f64;
+                            let text_hit = if text_py >= -4.0 && text_py <= text_track_h + 4.0 {
+                                // Allow clicking slightly outside the overlay
+                                // bounds so the very edge of the handle is reachable.
+                                let pad_sec = 8.0_f64 / self.zoom as f64;
                                 if let Some(overlay) = self
                                     .project
                                     .timeline
                                     .text_overlays()
                                     .iter()
-                                    .find(|o| t >= o.start && t <= o.end)
+                                    .find(|o| t >= o.start - pad_sec && t <= o.end + pad_sec)
                                 {
                                     let oid = overlay.id;
-                                    // Check if clicking on left or right resize edge.
-                                    if t <= overlay.start + edge_sec {
+                                    self.selected_overlay_id = Some(oid);
+                                    // Use the larger of a fixed pixel zone or 25%
+                                    // of the overlay width, so short overlays are
+                                    // still easy to resize.
+                                    let fixed_sec = 20.0_f64 / self.zoom as f64;
+                                    let frac_sec = (overlay.end - overlay.start) * 0.25;
+                                    let edge_sec = fixed_sec.max(frac_sec);
+
+                                    let d_left = (t - overlay.start).abs();
+                                    let d_right = (t - overlay.end).abs();
+
+                                    if d_left <= edge_sec && d_left <= d_right {
                                         self.dragging_overlay_left_edge = Some(oid);
-                                    } else if t >= overlay.end - edge_sec {
+                                        true
+                                    } else if d_right <= edge_sec {
                                         self.dragging_overlay_right_edge = Some(oid);
+                                        true
                                     } else {
                                         self.dragging_overlay_id = Some(oid);
                                         self.overlay_drag_offset = t - overlay.start;
+                                        true
                                     }
-                                    self.selected_overlay_id = Some(oid);
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if !text_hit {
+                                // Clip track hit testing.
+                                let clip_py = pos.y - (origin.y + ruler_h);
+                                if clip_py >= 0.0 && clip_py <= track_h {
+                                    if let Some(clip) = self
+                                        .project
+                                        .timeline
+                                        .clips()
+                                        .iter()
+                                        .find(|c| t >= c.timeline_start && t <= c.timeline_end())
+                                    {
+                                        self.dragging_clip_id = Some(clip.id);
+                                        self.drag_offset = t - clip.timeline_start;
+                                        self.selected_clip_id = Some(clip.id);
+                                    }
                                 }
                             }
-                        }
                         }
                     }
                 }
