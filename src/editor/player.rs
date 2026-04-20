@@ -249,7 +249,9 @@ impl VideoPlayer {
         let running = Arc::new(AtomicBool::new(true));
         self.running = running.clone();
 
-        let (tx, rx) = bounded::<DecodedFrame>(1);
+        // Buffer 4 frames so the decode thread can stay ahead of the UI repaint
+        // cycle without blocking on every single frame.
+        let (tx, rx) = bounded::<DecodedFrame>(4);
         self.frame_rx = Some(rx);
 
         let thread = thread::Builder::new()
@@ -561,10 +563,14 @@ fn decode_segments(
                 _ => break,
             }
 
+            // Move the buffer into the frame and allocate a fresh one for the
+            // next iteration – this avoids an 8 MB clone on every frame.
+            let new_buf = vec![0u8; frame_size];
+            let rgba = std::mem::replace(&mut buf, new_buf);
             let frame = DecodedFrame {
                 width,
                 height,
-                rgba: buf.clone(),
+                rgba,
                 timeline_pos,
             };
 

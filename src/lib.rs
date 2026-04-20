@@ -4,8 +4,23 @@ pub mod recorder;
 
 use anyhow::Result;
 
+// On Windows the default multimedia timer resolution is ~15 ms, which means
+// thread::sleep(10ms) actually sleeps ~15 ms.  Requesting 1 ms resolution
+// brings the OS scheduler in line with what the decode thread expects and
+// gives much more accurate per-frame pacing.
+#[cfg(target_os = "windows")]
+mod win_timer {
+    #[link(name = "winmm")]
+    extern "system" {
+        pub fn timeBeginPeriod(uPeriod: u32) -> u32;
+    }
+}
+
 /// Initialise logging and launch the eframe event-loop.
 pub fn run() -> Result<()> {
+    // Enable 1 ms timer resolution on Windows for accurate frame pacing.
+    #[cfg(target_os = "windows")]
+    unsafe { win_timer::timeBeginPeriod(1); }
     // Write logs to a file so we can inspect timeline state.
     use std::io::Write;
     let log_path = std::env::temp_dir().join("freetasia-debug.log");
