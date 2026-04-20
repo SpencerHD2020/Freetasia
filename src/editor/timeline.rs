@@ -116,6 +116,27 @@ impl Timeline {
         });
     }
 
+    /// Ripple-shift all clips (and text overlays) that start at or after
+    /// `threshold` by `delta` seconds, excluding the clip `exclude_id`.
+    ///
+    /// Call this after a clip's duration changes (speed or trim edit) so
+    /// that downstream clips stay correctly positioned instead of
+    /// overlapping or leaving gaps.
+    pub fn ripple_shift_after(&mut self, threshold: f64, delta: f64, exclude_id: u64) {
+        for clip in &mut self.clips {
+            if clip.id != exclude_id && clip.timeline_start >= threshold - 1e-6 {
+                clip.timeline_start = (clip.timeline_start + delta).max(0.0);
+            }
+        }
+        for overlay in &mut self.text_overlays {
+            if overlay.start >= threshold - 1e-6 {
+                overlay.start = (overlay.start + delta).max(0.0);
+                overlay.end = (overlay.end + delta).max(0.0);
+            }
+        }
+        self.sort_clips();
+    }
+
     // ── Text overlays ────────────────────────────────────────────────────
 
     /// Add a text overlay and return its assigned id.

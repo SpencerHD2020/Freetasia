@@ -1414,6 +1414,13 @@ impl FreetasiaApp {
             ui.horizontal(|ui| {
                 ui.label("Selected clip:");
                 let tl = &mut self.project.timeline;
+
+                // Snapshot the clip's end before any edits so we can
+                // ripple-shift subsequent clips when duration changes.
+                let old_end = tl.clips().iter()
+                    .find(|c| c.id == sel_id)
+                    .map(|c| c.timeline_end());
+
                 if let Some(clip) = tl.clip_mut(sel_id) {
                     ui.text_edit_singleline(&mut clip.label);
                     ui.label("  Trim:");
@@ -1439,6 +1446,22 @@ impl FreetasiaApp {
                             .suffix("x"),
                     );
                 }
+
+                // Ripple: if trim or speed edits changed this clip's
+                // duration, shift all downstream clips by the delta so
+                // they don't overlap or leave gaps.
+                if let Some(old_e) = old_end {
+                    if let Some(new_e) = tl.clips().iter()
+                        .find(|c| c.id == sel_id)
+                        .map(|c| c.timeline_end())
+                    {
+                        let delta = new_e - old_e;
+                        if delta.abs() > 1e-6 {
+                            tl.ripple_shift_after(old_e.min(new_e), delta, sel_id);
+                        }
+                    }
+                }
+
                 if ui
                     .button("✂ Split")
                     .on_hover_text("Split clip at playhead")
