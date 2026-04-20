@@ -149,6 +149,7 @@ fn capture_loop(
 
     let frame_interval = Duration::from_secs(1) / fps.max(1);
     let start = Instant::now();
+    let mut frames_written: u64 = 0;
 
     // Spawn ffmpeg to encode frames written to its stdin.
     let mut ffmpeg = spawn_ffmpeg_encoder(width, height, fps, &output_path)?;
@@ -177,6 +178,16 @@ fn capture_loop(
                         if s.write_all(&rgba).is_err() {
                             log::warn!("ffmpeg stdin closed; stopping capture");
                             break;
+                        }
+                        frames_written += 1;
+                        // Log actual achieved fps every 60 frames.
+                        if frames_written % 60 == 0 {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            let actual_fps = frames_written as f64 / elapsed;
+                            log::debug!(
+                                "Capture: {} frames in {:.1}s = {:.1} fps (target {})",
+                                frames_written, elapsed, actual_fps, fps
+                            );
                         }
                     }
 
@@ -208,6 +219,14 @@ fn capture_loop(
 
 /// Spawn an `ffmpeg` process that reads raw RGBA frames on stdin and encodes
 /// them to `output_path` using libx264.
+///
+/// We use `-use_wallclock_as_timestamps 1` so that each frame is stamped with
+/// the real wall-clock time it arrives rather than a synthetic `frame / fps`
+/// value.  On Windows the GDI screenshot API typically runs at 15-25 fps
+/// regardless of the declared target; without wallclock timestamps the file
+/// ends up 2-4× shorter than the actual recording, making scrub positions
+/// completely wrong.  The output `fps` filter resamples to a constant
+/// framerate so the file is compatible with all players and editors.
 fn spawn_ffmpeg_encoder(
     width: u32,
     height: u32,
@@ -216,17 +235,28 @@ fn spawn_ffmpeg_encoder(
 ) -> Result<Child> {
     let size = format!("{width}x{height}");
     let fps_str = fps.to_string();
+    let fps_filter = format!("fps={fps}");
     let out = output_path.to_string_lossy();
 
     let ffmpeg_path = find_ffmpeg()?;
     let mut cmd = Command::new(&ffmpeg_path);
     cmd.args([
             "-y",
+            // Stamp each incoming frame with the actual wall-clock time it
+            // arrives.  This decouples the file duration from the OS capture
+            // rate so it always matches real recording time.
+            "-use_wallclock_as_timestamps", "1",
             "-f", "rawvideo",
             "-pixel_format", "rgba",
             "-video_size", &size,
+            // rawvideo needs a framerate hint to know how many bytes = 1
+            // frame (width × height × 4).  This does NOT control timestamps
+            // when -use_wallclock_as_timestamps is active.
             "-framerate", &fps_str,
             "-i", "pipe:0",
+            // Resample to constant framerate output; duplicates frames when
+            // the OS capture runs slower than the target fps.
+            "-vf", &fps_filter,
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-preset", "ultrafast",

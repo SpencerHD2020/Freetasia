@@ -6,7 +6,25 @@ use anyhow::Result;
 
 /// Initialise logging and launch the eframe event-loop.
 pub fn run() -> Result<()> {
-    env_logger::init();
+    // Write logs to a file so we can inspect timeline state.
+    use std::io::Write;
+    let log_path = std::env::temp_dir().join("freetasia-debug.log");
+    let target = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("Cannot open log file");
+    let target = std::sync::Mutex::new(target);
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)
+        .format(move |_buf, record| {
+            let now = chrono::Local::now().format("%H:%M:%S%.3f");
+            let line = format!("[{now} {} {}] {}\n", record.level(), record.target(), record.args());
+            let _ = target.lock().unwrap().write_all(line.as_bytes());
+            Ok(())
+        })
+        .init();
+    log::info!("Log file: {}", log_path.display());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

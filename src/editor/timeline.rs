@@ -92,12 +92,28 @@ impl Timeline {
         // Shorten the first clip to end at the split point.
         self.clips[idx].trim_end = split_source;
 
+        log::debug!(
+            "SPLIT clip id={} '{}' at tl={:.3}s (source={:.3}s) → first trim={:.3}..{:.3} | second id={} trim={:.3}..{:.3} tl_start={:.3}",
+            clip_id, self.clips[idx].label, split_at, split_source,
+            self.clips[idx].trim_start, self.clips[idx].trim_end,
+            second_id, second.trim_start, second.trim_end, second.timeline_start,
+        );
+
         self.clips.push(second);
         self.clips.sort_by(|a, b| {
             a.timeline_start
                 .partial_cmp(&b.timeline_start)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        // Log all clips after split.
+        for c in &self.clips {
+            log::debug!(
+                "  POST-SPLIT clip id={} '{}' trim={:.3}..{:.3} speed={:.2}x tl={:.3}..{:.3} dur={:.3}",
+                c.id, c.label, c.trim_start, c.trim_end, c.speed,
+                c.timeline_start, c.timeline_end(), c.duration(),
+            );
+        }
 
         Some(second_id)
     }
@@ -114,6 +130,27 @@ impl Timeline {
                 .partial_cmp(&b.timeline_start)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+    }
+
+    /// Ripple-shift all clips (and overlays) that start at or after
+    /// `threshold` by `delta` seconds, excluding the clip `exclude_id`.
+    ///
+    /// Call this after a clip's duration changes (speed or trim edit) so
+    /// that downstream clips stay correctly positioned instead of
+    /// overlapping or leaving gaps.
+    pub fn ripple_shift_after(&mut self, threshold: f64, delta: f64, exclude_id: u64) {
+        for clip in &mut self.clips {
+            if clip.id != exclude_id && clip.timeline_start >= threshold - 1e-6 {
+                clip.timeline_start = (clip.timeline_start + delta).max(0.0);
+            }
+        }
+        for overlay in &mut self.overlays {
+            if overlay.start >= threshold - 1e-6 {
+                overlay.start = (overlay.start + delta).max(0.0);
+                overlay.end = (overlay.end + delta).max(0.0);
+            }
+        }
+        self.sort_clips();
     }
 
     // ── Overlays (text, blur, etc.) ─────────────────────────────────────

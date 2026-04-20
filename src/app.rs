@@ -552,6 +552,10 @@ impl FreetasiaApp {
             if is_playing {
                 if ui.button("⏸  Pause").clicked() {
                     self.player.pause();
+                    // Immediately scrub to the exact pause position so the
+                    // preview shows the accurate frame rather than whatever
+                    // the decode thread last pushed before the clock froze.
+                    self.request_scrub_frame();
                 }
                 if ui.button("⏹  Stop").clicked() {
                     self.player.stop();
@@ -663,6 +667,15 @@ impl FreetasiaApp {
             .collect();
 
         let start_pos = self.project.timeline.playhead;
+
+        log::info!("PLAY start_pos={:.3} fps={} res={}x{}", start_pos, self.project.output_fps, width, height);
+        for (i, (ref path, ts, sd, sp, tls, tld)) in segments.iter().enumerate() {
+            log::info!(
+                "  SEGMENT[{}] file={} trim_start={:.3} src_dur={:.3} speed={:.2}x tl_start={:.3} tl_dur={:.3} tl_end={:.3}",
+                i, path.display(), ts, sd, sp, tls, tld, tls + tld,
+            );
+        }
+
         self.player
             .play(segments, start_pos, self.project.output_fps, width, height);
         self.status("Playing");
@@ -1546,6 +1559,13 @@ impl FreetasiaApp {
             ui.horizontal(|ui| {
                 ui.label("Selected clip:");
                 let tl = &mut self.project.timeline;
+
+                // Snapshot the clip's end before any edits so we can
+                // ripple-shift subsequent clips when duration changes.
+                let old_end = tl.clips().iter()
+                    .find(|c| c.id == sel_id)
+                    .map(|c| c.timeline_end());
+
                 if let Some(clip) = tl.clip_mut(sel_id) {
                     ui.text_edit_singleline(&mut clip.label);
                     ui.label("  Trim:");
@@ -1571,6 +1591,34 @@ impl FreetasiaApp {
                             .suffix("x"),
                     );
                 }
+
+                // Ripple: if trim or speed edits changed this clip's
+                // duration, shift all downstream clips by the delta so
+                // they don't overlap or leave gaps.
+                if let Some(old_e) = old_end {
+                    if let Some(new_e) = tl.clips().iter()
+                        .find(|c| c.id == sel_id)
+                        .map(|c| c.timeline_end())
+                    {
+                        let delta = new_e - old_e;
+                        if delta.abs() > 1e-6 {
+                            log::debug!(
+                                "RIPPLE clip id={} old_end={:.3} new_end={:.3} delta={:.3}",
+                                sel_id, old_e, new_e, delta,
+                            );
+                            tl.ripple_shift_after(old_e.min(new_e), delta, sel_id);
+                            // Log all clip states after ripple.
+                            for c in tl.clips() {
+                                log::debug!(
+                                    "  POST-RIPPLE clip id={} '{}' trim={:.3}..{:.3} speed={:.2}x src_dur={:.3} tl={:.3}..{:.3} dur={:.3}",
+                                    c.id, c.label, c.trim_start, c.trim_end, c.speed,
+                                    c.source_duration(), c.timeline_start, c.timeline_end(), c.duration(),
+                                );
+                            }
+                        }
+                    }
+                }
+
                 if ui
                     .button("✂ Split")
                     .on_hover_text("Split clip at playhead")
@@ -1893,11 +1941,24 @@ impl FreetasiaApp {
 
     fn stop_recording(&mut self) {
         if let Some(session) = self.recorder.stop_recording() {
-            let dur = session.duration.as_secs_f64();
-            if dur < 0.5 {
+            let wall_dur = session.duration.as_secs_f64();
+            if wall_dur < 0.5 {
                 self.status("Recording too short (<0.5 s) – discarded");
                 return;
             }
+            // Use the actual encoded file duration rather than the wall-clock
+            // elapsed time. The capture loop may run slower than the declared
+            // fps (Windows screenshot rate limits), causing ffmpeg to produce a
+            // file that is physically shorter than the wall-clock duration.
+            // Using the wall-clock value for trim_end makes the clip longer
+            // than the file, so scrubbing past the midpoint always returns the
+            // last frame.
+            let dur = crate::editor::player::probe_video_duration(&session.video_path)
+                .unwrap_or(wall_dur);
+            log::info!(
+                "Recording finished: wall={:.3}s file={:.3}s path={}",
+                wall_dur, dur, session.video_path.display()
+            );
             let label = format!(
                 "Recording {}",
                 chrono::Local::now().format("%H:%M:%S")

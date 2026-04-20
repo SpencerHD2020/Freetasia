@@ -159,6 +159,12 @@ fn build_ffmpeg_args(timeline: &Timeline, output_path: &Path) -> Result<(String,
     args.push("libx264".into());
     args.push("-pix_fmt".into());
     args.push("yuv420p".into());
+    // Force constant frame rate output so that sped-up segments don't
+    // cause the container to report an incorrect duration / frame rate.
+    args.push("-r".into());
+    args.push("60".into());
+    args.push("-vsync".into());
+    args.push("cfr".into());
     // Request progress output on stderr.
     args.push("-progress".into());
     args.push("pipe:2".into());
