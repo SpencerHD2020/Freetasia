@@ -579,7 +579,8 @@ impl FreetasiaApp {
 
             // Playback position display.
             if is_playing || is_paused {
-                let pos = self.player.current_position();
+                let pos = self.player.last_frame_pos
+                    .unwrap_or(self.project.timeline.playhead);
                 ui.label(
                     RichText::new(fmt_duration_hms(pos))
                         .monospace()
@@ -615,10 +616,11 @@ impl FreetasiaApp {
             return;
         }
 
-        let pos = self.player.current_position();
-        self.project.timeline.set_playhead(pos);
-
         if let Some(frame) = self.player.try_recv_frame() {
+            // Drive the playhead from the actual decoded frame position so it
+            // stays in sync with the video regardless of ffmpeg startup delay.
+            self.project.timeline.set_playhead(frame.timeline_pos);
+
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [frame.width as usize, frame.height as usize],
                 &frame.rgba,
@@ -633,6 +635,10 @@ impl FreetasiaApp {
                     ));
                 }
             }
+        } else if let Some(pos) = self.player.last_frame_pos {
+            // No new frame this tick — keep playhead at last known frame
+            // position rather than letting the wall clock race ahead.
+            self.project.timeline.set_playhead(pos);
         }
 
         if self.player.is_finished() {

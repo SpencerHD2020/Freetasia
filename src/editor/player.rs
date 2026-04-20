@@ -156,6 +156,9 @@ pub struct VideoPlayer {
     playback_clock: Option<Arc<PlaybackClock>>,
     play_start_position: f64,
     end_position: f64,
+    /// Timeline position of the most recently received decoded frame.
+    /// Drives the playhead so it stays in sync with actual video output.
+    pub last_frame_pos: Option<f64>,
     /// Receiver for single-frame scrub results.
     scrub_rx: Option<Receiver<DecodedFrame>>,
     scrub_thread: Option<JoinHandle<()>>,
@@ -183,6 +186,7 @@ impl Default for VideoPlayer {
             playback_clock: None,
             play_start_position: 0.0,
             end_position: 0.0,
+            last_frame_pos: None,
             scrub_rx: None,
             scrub_thread: None,
             scrub_cancel: Arc::new(AtomicBool::new(false)),
@@ -238,6 +242,7 @@ impl VideoPlayer {
 
         self.end_position = end_pos;
         self.play_start_position = start_pos;
+        self.last_frame_pos = None;
         let playback_clock = Arc::new(PlaybackClock::new());
         self.playback_clock = Some(playback_clock.clone());
 
@@ -277,15 +282,19 @@ impl VideoPlayer {
 
     /// Returns `true` when playback has reached the end of the timeline.
     pub fn is_finished(&self) -> bool {
-        self.state == PlaybackState::Playing && self.current_position() >= self.end_position - 0.01
+        self.state == PlaybackState::Playing
+            && self.last_frame_pos.unwrap_or(0.0) >= self.end_position - 0.1
     }
 
     /// Non-blocking: grab the next decoded frame (if available).
-    pub fn try_recv_frame(&self) -> Option<DecodedFrame> {
+    pub fn try_recv_frame(&mut self) -> Option<DecodedFrame> {
         let rx = self.frame_rx.as_ref()?;
         let mut latest = None;
         while let Ok(frame) = rx.try_recv() {
             latest = Some(frame);
+        }
+        if let Some(ref f) = latest {
+            self.last_frame_pos = Some(f.timeline_pos);
         }
         latest
     }
@@ -451,12 +460,6 @@ fn decode_segments(
     let frame_size = (width * height * 4) as usize;
     let frame_dur = 1.0 / fps.max(1) as f64;
 
-    // Compute the timeline end so we can cap clock reads correctly.
-    let end_pos = segments
-        .iter()
-        .map(|s| s.timeline_start + s.timeline_duration)
-        .fold(0.0f64, f64::max);
-
     for seg in &segments {
         if !running.load(Ordering::SeqCst) {
             break;
@@ -469,21 +472,12 @@ fn decode_segments(
             continue;
         }
 
-        // Re-read the clock now rather than using the fixed start_pos.
-        // ffmpeg spawning for the previous segment takes real wall time, so
-        // by the time we reach this segment the clock may already be ahead.
-        // Using the live clock position means we seek into the source at the
-        // correct offset, preventing the preview from drifting behind the
-        // playhead marker at clip transition points.
-        let clock_pos = playback_clock.current_position(start_pos, end_pos);
-
-        // If the entire segment has already been passed, skip it.
-        if seg_end <= clock_pos {
-            continue;
-        }
-
-        // Calculate seek offset inside this segment using current clock.
-        let offset_in_seg = (clock_pos - seg.timeline_start).max(0.0);
+        // Calculate seek offset if start_pos falls within this segment.
+        // For segments that begin after start_pos the offset is 0 — we always
+        // start from trim_start and let wait_for_timeline_pos pace the frames
+        // through any inter-segment gap. This ensures the first frame of every
+        // clip matches the scrub preview at the same position.
+        let offset_in_seg = (start_pos - seg.timeline_start).max(0.0);
         let source_offset = offset_in_seg * seg.speed;
         let seek_pos = seg.trim_start + source_offset;
         let remaining_source_dur = seg.trim_duration - source_offset;
