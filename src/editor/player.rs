@@ -366,14 +366,6 @@ fn decode_segments(
     let frame_size = (width * height * 4) as usize;
     let frame_dur = 1.0 / fps.max(1) as f64;
 
-    // Use a single global clock so that gaps between segments on the
-    // timeline are respected.  Without this, each segment would reset
-    // its own pacing origin and start delivering frames immediately,
-    // causing subsequent clips to play out of sync when a preceding
-    // clip was sped up (shrinking its timeline footprint and leaving
-    // a gap).
-    let global_start = Instant::now();
-
     for seg in &segments {
         if !running.load(Ordering::SeqCst) {
             break;
@@ -410,14 +402,11 @@ fn decode_segments(
         };
         let mut cmd = Command::new(&ffmpeg_path);
         cmd.args(["-ss", &format!("{seek_pos:.3}")])
-            // -t before -i makes it an *input* duration limit (source
-            // seconds), which is correct regardless of speed.  Placing
-            // it after -i would limit the *output* duration and clip
-            // slow-motion content early.
-            .args(["-t", &format!("{remaining_source_dur:.3}")])
             .arg("-i")
             .arg(&seg.source_path)
             .args([
+                "-t",
+                &format!("{remaining_source_dur:.3}"),
                 "-vf",
                 &filter,
                 "-f",
@@ -450,6 +439,8 @@ fn decode_segments(
 
         let mut buf = vec![0u8; frame_size];
         let mut timeline_pos = seg.timeline_start + offset_in_seg;
+        let playback_start = Instant::now();
+        let base_timeline = timeline_pos;
 
         loop {
             if !running.load(Ordering::SeqCst) {
@@ -468,22 +459,12 @@ fn decode_segments(
                 timeline_pos,
             };
 
-            // Pace delivery against the single global clock so that
-            // timeline gaps (e.g. after a speed change shrinks a clip)
-            // cause the decode thread to wait instead of delivering
-            // the next segment's frames too early.
-            let target_elapsed = Duration::from_secs_f64(timeline_pos - start_pos);
-            while running.load(Ordering::Relaxed) {
-                let actual = global_start.elapsed();
-                if actual >= target_elapsed {
-                    break;
-                }
-                // Sleep in small steps so we can respond to stop requests
-                // promptly, even during long gaps between segments.
-                thread::sleep((target_elapsed - actual).min(Duration::from_millis(50)));
-            }
-            if !running.load(Ordering::SeqCst) {
-                break;
+            // Pace delivery: wait until wall-clock time catches up to the
+            // frame's position so we don't flood the channel.
+            let target_elapsed = Duration::from_secs_f64(timeline_pos - base_timeline);
+            let actual_elapsed = playback_start.elapsed();
+            if target_elapsed > actual_elapsed {
+                thread::sleep(target_elapsed - actual_elapsed);
             }
 
             // Use send (blocking) so we wait for the consumer instead of
