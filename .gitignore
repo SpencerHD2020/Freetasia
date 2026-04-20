@@ -5,3 +5,4 @@ Cargo.lock
 *.avi
 *.mkv
 /recordings
+/dist
