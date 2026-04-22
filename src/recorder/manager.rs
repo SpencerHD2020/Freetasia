@@ -28,6 +28,8 @@ pub struct RecorderManager {
     pub monitor_index: usize,
     pub fps: u32,
     pub record_audio: bool,
+    /// Name of the microphone device to use (None = system default).
+    pub mic_device_name: Option<String>,
     /// Base directory for temporary recording files.
     pub output_dir: PathBuf,
 }
@@ -44,6 +46,7 @@ impl Default for RecorderManager {
             monitor_index: 0,
             fps: 60,
             record_audio: true,
+            mic_device_name: None,
             output_dir: std::env::temp_dir().join("freetasia"),
         }
     }
@@ -110,7 +113,7 @@ impl RecorderManager {
         let screen = ScreenRecorder::start(self.monitor_index, self.fps, video_path)?;
 
         let audio = if self.record_audio {
-            match AudioRecorder::start(audio_path) {
+            match AudioRecorder::start(audio_path, self.mic_device_name.as_deref()) {
                 Ok(a) => Some(a),
                 Err(e) => {
                     log::warn!("Audio recording unavailable: {e}");

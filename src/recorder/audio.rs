@@ -28,15 +28,39 @@ pub struct AudioRecorder {
 }
 
 impl AudioRecorder {
-    /// Start recording the default input device to `output_path`.
-    ///
-    /// Returns an error if no input device is available or if the sample
-    /// format is unsupported.
-    pub fn start(output_path: PathBuf) -> Result<Self> {
+    /// Enumerate all available audio input device names.
+    pub fn list_input_devices() -> Vec<String> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("No audio input device found")?;
+        match host.input_devices() {
+            Ok(devices) => devices
+                .filter_map(|d| d.name().ok())
+                .collect(),
+            Err(e) => {
+                log::warn!("Failed to enumerate audio input devices: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Start recording to `output_path`.
+    ///
+    /// If `device_name` is `Some`, the device whose name matches the given
+    /// string is used; otherwise the system default input device is used.
+    /// Returns an error if no matching device is available or if the sample
+    /// format is unsupported.
+    pub fn start(output_path: PathBuf, device_name: Option<&str>) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = match device_name {
+            Some(name) => {
+                host.input_devices()
+                    .context("Failed to enumerate audio input devices")?
+                    .find(|d| d.name().as_deref().ok() == Some(name))
+                    .with_context(|| format!("Audio input device '{}' not found", name))?
+            }
+            None => host
+                .default_input_device()
+                .context("No audio input device found")?,
+        };
 
         let config = device
             .default_input_config()

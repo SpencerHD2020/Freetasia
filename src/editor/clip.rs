@@ -19,6 +19,9 @@ pub struct Clip {
     /// Playback speed multiplier (1.0 = normal, 2.0 = 2× fast, 0.5 = half speed).
     #[serde(default = "default_speed")]
     pub speed: f64,
+    /// Optional path to a paired audio file (WAV) to mux into the export.
+    #[serde(default)]
+    pub audio_path: Option<PathBuf>,
 }
 
 fn default_speed() -> f64 {
@@ -36,6 +39,7 @@ impl Clip {
             timeline_start: 0.0,
             label: label.into(),
             speed: 1.0,
+            audio_path: None,
         }
     }
 

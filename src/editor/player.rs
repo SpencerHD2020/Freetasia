@@ -1,12 +1,13 @@
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::export::{find_ffmpeg, find_ffprobe};
 
@@ -167,6 +168,8 @@ pub struct VideoPlayer {
     scrub_busy: bool,
     /// Pending scrub request queued while a decode was in flight.
     scrub_pending: Option<ScrubRequest>,
+    /// Active audio output for the current playback session.
+    audio_playback: Option<AudioPlayback>,
 }
 
 impl VideoPlayer {
@@ -192,6 +195,7 @@ impl Default for VideoPlayer {
             scrub_cancel: Arc::new(AtomicBool::new(false)),
             scrub_busy: false,
             scrub_pending: None,
+            audio_playback: None,
         }
     }
 }
@@ -209,9 +213,11 @@ impl VideoPlayer {
     ///
     /// Each tuple: `(source_path, trim_start, source_duration, speed,
     ///               timeline_start, timeline_duration)`.
+    /// `audio_paths` is parallel to `segments` — the optional WAV path for each clip.
     pub fn play(
         &mut self,
         segments: Vec<(PathBuf, f64, f64, f64, f64, f64)>,
+        audio_paths: Vec<Option<PathBuf>>,
         start_pos: f64,
         fps: u32,
         frame_width: u32,
@@ -234,6 +240,16 @@ impl VideoPlayer {
                 timeline_duration: tld,
             })
             .collect();
+
+        // Keep a copy of segment metadata for audio (before segments is moved into the thread).
+        let segments_for_audio: Vec<PlaySegment> = segments.iter().map(|s| PlaySegment {
+            source_path: s.source_path.clone(),
+            trim_start: s.trim_start,
+            trim_duration: s.trim_duration,
+            speed: s.speed,
+            timeline_start: s.timeline_start,
+            timeline_duration: s.timeline_duration,
+        }).collect();
 
         let end_pos = segments
             .iter()
@@ -271,6 +287,23 @@ impl VideoPlayer {
             .ok();
 
         self.decode_thread = thread;
+
+        // Start audio output for any segments that have an associated WAV file.
+        let audio_segs: Vec<(PathBuf, f64, f64, f64, f64, f64)> = audio_paths
+            .into_iter()
+            .zip(segments_for_audio.iter())
+            .filter_map(|(ap, seg)| {
+                ap.filter(|p| p.exists()).map(|p| {
+                    (p, seg.trim_start, seg.trim_duration, seg.speed, seg.timeline_start, seg.timeline_duration)
+                })
+            })
+            .collect();
+        self.audio_playback = if audio_segs.is_empty() {
+            None
+        } else {
+            AudioPlayback::start(&audio_segs, start_pos)
+        };
+
         self.state = PlaybackState::Playing;
     }
 
@@ -306,6 +339,9 @@ impl VideoPlayer {
             if let Some(clock) = &self.playback_clock {
                 clock.pause();
             }
+            if let Some(ref ap) = self.audio_playback {
+                ap.pause();
+            }
             self.state = PlaybackState::Paused;
         }
     }
@@ -314,6 +350,9 @@ impl VideoPlayer {
         if self.state == PlaybackState::Paused {
             if let Some(clock) = &self.playback_clock {
                 clock.resume();
+            }
+            if let Some(ref ap) = self.audio_playback {
+                ap.resume();
             }
             self.state = PlaybackState::Playing;
         }
@@ -325,6 +364,9 @@ impl VideoPlayer {
         self.frame_rx = None;
         if let Some(h) = self.decode_thread.take() {
             let _ = h.join();
+        }
+        if let Some(mut ap) = self.audio_playback.take() {
+            ap.stop();
         }
         self.state = PlaybackState::Stopped;
         self.playback_clock = None;
@@ -751,5 +793,188 @@ pub fn probe_video_resolution(path: &std::path::Path) -> Option<(u32, u32)> {
         Some((w, h))
     } else {
         None
+    }
+}
+
+// ── Audio playback ──────────────────────────────────────────────────────────
+
+/// Plays back the audio track(s) matching the video segments in real time.
+pub struct AudioPlayback {
+    /// Keeps the cpal stream alive.
+    _stream: cpal::Stream,
+    paused: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+}
+
+impl AudioPlayback {
+    /// Build the interleaved sample buffer from all audio segments, then start
+    /// a cpal output stream from `play_start_pos`.
+    ///
+    /// `audio_segs`: `(audio_path, trim_start, source_dur, speed, tl_start, tl_dur)`
+    pub fn start(
+        audio_segs: &[(PathBuf, f64, f64, f64, f64, f64)],
+        play_start_pos: f64,
+    ) -> Option<Self> {
+        let host = cpal::default_host();
+        let device = host.default_output_device()?;
+        let config = device.default_output_config().ok()?;
+        let out_sr = config.sample_rate().0 as f64;
+        let out_ch = config.channels() as usize;
+
+        // Total timeline end across all audio segments.
+        let tl_end = audio_segs
+            .iter()
+            .map(|(_, _, _, _, tls, tld)| tls + tld)
+            .fold(play_start_pos, f64::max);
+
+        if tl_end <= play_start_pos {
+            return None;
+        }
+
+        let total_frames = ((tl_end - play_start_pos) * out_sr).ceil() as usize + out_sr as usize;
+        let total_samples = total_frames * out_ch;
+        let mut samples = vec![0.0f32; total_samples];
+
+        for (path, trim_start, _source_dur, speed, tl_start, tl_dur) in audio_segs {
+            let seg_tl_start = tl_start.max(play_start_pos);
+            let seg_tl_end = (tl_start + tl_dur).min(tl_end);
+            if seg_tl_start >= seg_tl_end {
+                continue;
+            }
+
+            let Ok(mut reader) = hound::WavReader::open(path) else {
+                continue;
+            };
+            let spec = reader.spec();
+            let wav_sr = spec.sample_rate as f64;
+            let wav_ch = spec.channels as usize;
+
+            let wav_samples: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => {
+                    reader.samples::<f32>().filter_map(|s| s.ok()).collect()
+                }
+                hound::SampleFormat::Int => {
+                    let scale = (1i64 << (spec.bits_per_sample as u32 - 1)) as f32;
+                    reader.samples::<i32>()
+                        .filter_map(|s| s.ok())
+                        .map(|s| s as f32 / scale)
+                        .collect()
+                }
+            };
+
+            let out_frame_start = ((seg_tl_start - play_start_pos) * out_sr) as usize;
+            let out_frames = ((seg_tl_end - seg_tl_start) * out_sr).ceil() as usize;
+
+            // Offset into the segment caused by seeking past its start.
+            let seg_seek_offset = (play_start_pos - tl_start).max(0.0);
+            let src_start_secs = trim_start + seg_seek_offset * speed;
+
+            for out_frame in 0..out_frames {
+                let src_secs = src_start_secs + (out_frame as f64 / out_sr) * speed;
+                let src_frame = (src_secs * wav_sr) as usize;
+                let wav_frames = wav_samples.len() / wav_ch.max(1);
+                if src_frame >= wav_frames {
+                    break;
+                }
+
+                for ch in 0..out_ch {
+                    let out_idx = (out_frame_start + out_frame) * out_ch + ch;
+                    if out_idx >= total_samples {
+                        break;
+                    }
+                    // Down-mix if WAV has fewer channels than output.
+                    let src_ch = ch.min(wav_ch.saturating_sub(1));
+                    let src_idx = src_frame * wav_ch + src_ch;
+                    if src_idx < wav_samples.len() {
+                        samples[out_idx] = wav_samples[src_idx];
+                    }
+                }
+            }
+        }
+
+        let samples = Arc::new(samples);
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
+
+        let err_fn = |e: cpal::StreamError| log::error!("Audio output error: {e}");
+
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => {
+                let (s, c, r, p) = (samples.clone(), cursor.clone(), running.clone(), paused.clone());
+                device.build_output_stream(
+                    &config.into(),
+                    move |data: &mut [f32], _| audio_fill_f32(data, &s, &c, &r, &p),
+                    err_fn,
+                    None,
+                )
+            }
+            cpal::SampleFormat::I16 => {
+                let (s, c, r, p) = (samples.clone(), cursor.clone(), running.clone(), paused.clone());
+                device.build_output_stream(
+                    &config.into(),
+                    move |data: &mut [i16], _| audio_fill_i16(data, &s, &c, &r, &p),
+                    err_fn,
+                    None,
+                )
+            }
+            _ => return None,
+        }
+        .ok()?;
+
+        stream.play().ok()?;
+
+        Some(Self {
+            _stream: stream,
+            paused,
+            running,
+        })
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+fn audio_fill_f32(
+    data: &mut [f32],
+    samples: &[f32],
+    cursor: &AtomicUsize,
+    running: &AtomicBool,
+    paused: &AtomicBool,
+) {
+    if !running.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+        data.fill(0.0);
+        return;
+    }
+    let pos = cursor.fetch_add(data.len(), Ordering::Relaxed);
+    for (i, s) in data.iter_mut().enumerate() {
+        *s = samples.get(pos + i).copied().unwrap_or(0.0);
+    }
+}
+
+fn audio_fill_i16(
+    data: &mut [i16],
+    samples: &[f32],
+    cursor: &AtomicUsize,
+    running: &AtomicBool,
+    paused: &AtomicBool,
+) {
+    if !running.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+        data.fill(0);
+        return;
+    }
+    let pos = cursor.fetch_add(data.len(), Ordering::Relaxed);
+    for (i, s) in data.iter_mut().enumerate() {
+        let f = samples.get(pos + i).copied().unwrap_or(0.0);
+        *s = (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
     }
 }

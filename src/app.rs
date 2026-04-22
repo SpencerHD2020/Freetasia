@@ -9,6 +9,7 @@ use crate::editor::{
     project::Project,
 };
 use crate::recorder::{
+    audio::AudioRecorder,
     manager::RecorderManager,
     RecordingState,
 };
@@ -29,6 +30,10 @@ const COLOR_TEXT_OVERLAY: Color32 = Color32::from_rgb(255, 200, 50);
 const COLOR_TEXT_OVERLAY_SELECTED: Color32 = Color32::from_rgb(255, 230, 100);
 const COLOR_BLUR_OVERLAY: Color32 = Color32::from_rgb(100, 160, 255);
 const COLOR_BLUR_OVERLAY_SELECTED: Color32 = Color32::from_rgb(140, 190, 255);
+const COLOR_WAVEFORM: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 70);
+const COLOR_WAVEFORM_SELECTED: Color32 = Color32::from_rgba_premultiplied(255, 255, 255, 120);
+/// Waveform peaks stored per second of source audio.
+const WAVEFORM_PEAKS_PER_SEC: f64 = 200.0;
 
 // ── App state ───────────────────────────────────────────────────────────────
 
@@ -38,6 +43,8 @@ pub struct FreetasiaApp {
     recorder: RecorderManager,
     /// Available monitor names (populated once at startup).
     monitor_names: Vec<String>,
+    /// Available audio input device names (populated once at startup).
+    mic_device_names: Vec<String>,
 
     // ── Editor ──
     project: Project,
@@ -103,16 +110,22 @@ pub struct FreetasiaApp {
     export_progress: Option<f32>,
     export_progress_rx: Option<crossbeam_channel::Receiver<ExportProgress>>,
     exporting: bool,
+
+    // ── Waveform cache ──
+    /// Downsampled peak amplitudes keyed by clip id.
+    waveform_cache: std::collections::HashMap<u64, Vec<f32>>,
 }
 
 impl FreetasiaApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let monitor_names = detect_monitor_names();
+        let mic_device_names = AudioRecorder::list_input_devices();
         let ffmpeg_ok = export::ffmpeg_available();
 
         Self {
             recorder: RecorderManager::new(),
             monitor_names,
+            mic_device_names,
             project: Project::default(),
             selected_clip_id: None,
             preview_texture: None,
@@ -147,6 +160,7 @@ impl FreetasiaApp {
             export_progress: None,
             export_progress_rx: None,
             exporting: false,
+            waveform_cache: std::collections::HashMap::new(),
         }
     }
 }
@@ -693,6 +707,11 @@ impl FreetasiaApp {
             })
             .collect();
 
+        let audio_paths: Vec<Option<std::path::PathBuf>> = clips
+            .iter()
+            .map(|c| c.audio_path.clone())
+            .collect();
+
         let start_pos = self.project.timeline.playhead;
 
         log::info!("PLAY start_pos={:.3} fps={} res={}x{}", start_pos, self.project.output_fps, width, height);
@@ -704,7 +723,7 @@ impl FreetasiaApp {
         }
 
         self.player
-            .play(segments, start_pos, self.project.output_fps, width, height);
+            .play(segments, audio_paths, start_pos, self.project.output_fps, width, height);
         self.status("Playing");
     }
 
@@ -963,6 +982,35 @@ impl FreetasiaApp {
                     ui.checkbox(&mut self.recorder.record_audio, "");
                     ui.end_row();
 
+                    // Microphone selector (only relevant when audio is enabled).
+                    if self.recorder.record_audio {
+                        ui.label("Microphone:");
+                        let current_mic = self
+                            .recorder
+                            .mic_device_name
+                            .clone()
+                            .unwrap_or_else(|| "Default".into());
+                        egui::ComboBox::from_id_source("mic_combo")
+                            .selected_text(&current_mic)
+                            .show_ui(ui, |ui| {
+                                // "Default" option resets to system default.
+                                let none_selected = self.recorder.mic_device_name.is_none();
+                                if ui
+                                    .selectable_label(none_selected, "Default")
+                                    .clicked()
+                                {
+                                    self.recorder.mic_device_name = None;
+                                }
+                                for name in &self.mic_device_names.clone() {
+                                    let selected = self.recorder.mic_device_name.as_deref() == Some(name.as_str());
+                                    if ui.selectable_label(selected, name).clicked() {
+                                        self.recorder.mic_device_name = Some(name.clone());
+                                    }
+                                }
+                            });
+                        ui.end_row();
+                    }
+
                     // Output directory.
                     ui.label("Output dir:");
                     let mut out = self.recorder.output_dir.to_string_lossy().into_owned();
@@ -1030,25 +1078,96 @@ impl FreetasiaApp {
 
                 // ── Clips ────────────────────────────────────────────────
                 let track_top = origin.y + ruler_h + 4.0;
-                for clip in self.project.timeline.clips() {
-                    let x0 = origin.x + clip.timeline_start as f32 * self.zoom;
-                    let x1 = origin.x + clip.timeline_end() as f32 * self.zoom;
+
+                // Pre-pass: load any waveforms not yet cached (must finish
+                // before the immutable draw loop to avoid borrow conflicts).
+                struct ClipInfo {
+                    id: u64,
+                    tl_start: f64,
+                    tl_end: f64,
+                    trim_start: f64,
+                    speed: f64,
+                    label: String,
+                }
+                let to_load: Vec<(u64, std::path::PathBuf)> = self
+                    .project.timeline.clips().iter()
+                    .filter_map(|c| c.audio_path.clone().map(|p| (c.id, p)))
+                    .filter(|(id, _)| !self.waveform_cache.contains_key(id))
+                    .collect();
+                for (id, path) in to_load {
+                    // Always insert — empty Vec is a "failed" sentinel so we
+                    // don't retry on every frame, which would stutter the UI.
+                    let peaks = load_waveform_peaks(&path).unwrap_or_default();
+                    self.waveform_cache.insert(id, peaks);
+                }
+                let clip_infos: Vec<ClipInfo> = self.project.timeline.clips()
+                    .iter()
+                    .map(|c| ClipInfo {
+                        id: c.id,
+                        tl_start: c.timeline_start,
+                        tl_end: c.timeline_end(),
+                        trim_start: c.trim_start,
+                        speed: c.speed,
+                        label: c.label.clone(),
+                    })
+                    .collect();
+
+                for ci in &clip_infos {
+                    let x0 = origin.x + ci.tl_start as f32 * self.zoom;
+                    let x1 = origin.x + ci.tl_end as f32 * self.zoom;
                     let clip_rect = Rect::from_min_max(
                         Pos2::new(x0, track_top),
                         Pos2::new(x1.max(x0 + 2.0), track_top + track_h),
                     );
 
-                    let selected = self.selected_clip_id == Some(clip.id);
+                    let selected = self.selected_clip_id == Some(ci.id);
                     let fill = if selected { COLOR_CLIP_SELECTED } else { COLOR_CLIP };
                     painter.rect_filled(clip_rect, 3.0, fill);
                     painter.rect_stroke(clip_rect, 3.0, Stroke::new(1.0, Color32::WHITE));
 
-                    // Clip label.
+                    // Waveform (rendered over fill, behind label).
+                    if let Some(peaks) = self.waveform_cache.get(&ci.id).filter(|p| !p.is_empty()) {
+                        let wave_color = if selected { COLOR_WAVEFORM_SELECTED } else { COLOR_WAVEFORM };
+                        let mid_y = track_top + track_h * 0.65;
+                        let half_h = track_h * 0.32;
+                        let mut px = clip_rect.min.x;
+                        while px < clip_rect.max.x {
+                            // Compute the source-file time range this pixel covers.
+                            let clip_t0 = (px - x0) as f64 / self.zoom as f64;
+                            let clip_t1 = (px + 1.0 - x0) as f64 / self.zoom as f64;
+                            let source_t0 = ci.trim_start + clip_t0 * ci.speed;
+                            let source_t1 = ci.trim_start + clip_t1 * ci.speed;
+                            // Map to peak indices and take the max amplitude in
+                            // that range so every spike is visible at any zoom.
+                            let idx0 = (source_t0 * WAVEFORM_PEAKS_PER_SEC) as usize;
+                            let idx1 = ((source_t1 * WAVEFORM_PEAKS_PER_SEC) as usize)
+                                .min(peaks.len().saturating_sub(1));
+                            let amp = if idx0 < peaks.len() {
+                                peaks[idx0..=idx1.max(idx0)]
+                                    .iter()
+                                    .copied()
+                                    .fold(0.0f32, f32::max)
+                            } else {
+                                0.0
+                            };
+                            let bar_h = (amp * half_h).max(1.0);
+                            painter.line_segment(
+                                [
+                                    Pos2::new(px + 0.5, mid_y - bar_h),
+                                    Pos2::new(px + 0.5, mid_y + bar_h),
+                                ],
+                                Stroke::new(1.0, wave_color),
+                            );
+                            px += 1.0;
+                        }
+                    }
+
+                    // Clip label (always on top of waveform).
                     let label_pos = Pos2::new(x0 + 4.0, track_top + 4.0);
                     painter.text(
                         label_pos,
                         egui::Align2::LEFT_TOP,
-                        &clip.label,
+                        &ci.label,
                         egui::FontId::proportional(12.0),
                         Color32::WHITE,
                     );
@@ -1184,23 +1303,23 @@ impl FreetasiaApp {
                     ],
                     Stroke::new(2.0, COLOR_PLAYHEAD),
                 );
-                // Handle: square with a small downward point.
+                // Handle: square with a small downward point (doubled size for easier grabbing).
                 let handle_top = origin.y;
                 let sq = handle_size * 0.8;
                 painter.rect_filled(
                     Rect::from_center_size(
-                        Pos2::new(ph_x, handle_top + sq * 0.5),
-                        Vec2::new(sq * 2.0, sq),
+                        Pos2::new(ph_x, handle_top + sq),
+                        Vec2::new(sq * 4.0, sq * 2.0),
                     ),
                     2.0,
                     COLOR_PLAYHEAD,
                 );
-                // Small downward notch.
+                // Small downward notch (scaled to match doubled handle).
                 painter.add(egui::Shape::convex_polygon(
                     vec![
-                        Pos2::new(ph_x - 3.0, handle_top + sq),
-                        Pos2::new(ph_x + 3.0, handle_top + sq),
-                        Pos2::new(ph_x, handle_top + sq + 5.0),
+                        Pos2::new(ph_x - 6.0, handle_top + sq * 2.0),
+                        Pos2::new(ph_x + 6.0, handle_top + sq * 2.0),
+                        Pos2::new(ph_x, handle_top + sq * 2.0 + 10.0),
                     ],
                     COLOR_PLAYHEAD,
                     Stroke::NONE,
@@ -1210,6 +1329,8 @@ impl FreetasiaApp {
                 let timeline_bottom = origin.y + total_h;
                 let trim_h = handle_size * 1.5;
                 let trim_y_top = handle_top;
+                // Offset left/right handles below the (now doubled) center handle.
+                let trim_y_offset = sq * 2.0 + 4.0;
 
                 // Left trim handle: triangle pointing left, positioned so its
                 // right (flat) edge butts against the left edge of the center square.
@@ -1225,9 +1346,9 @@ impl FreetasiaApp {
                     let flat_x = lx.min(ph_x - sq);
                     painter.add(egui::Shape::convex_polygon(
                         vec![
-                            Pos2::new(flat_x, trim_y_top),                              // top-right
-                            Pos2::new(flat_x, trim_y_top + trim_h),                     // bottom-right
-                            Pos2::new(flat_x - trim_handle_w, trim_y_top + trim_h * 0.5), // left point
+                            Pos2::new(flat_x, trim_y_top + trim_y_offset),                              // top-right
+                            Pos2::new(flat_x, trim_y_top + trim_y_offset + trim_h),                     // bottom-right
+                            Pos2::new(flat_x - trim_handle_w, trim_y_top + trim_y_offset + trim_h * 0.5), // left point
                         ],
                         COLOR_TRIM_HANDLE,
                         Stroke::new(1.0, Color32::WHITE),
@@ -1247,9 +1368,9 @@ impl FreetasiaApp {
                     let flat_x = rx.max(ph_x + sq);
                     painter.add(egui::Shape::convex_polygon(
                         vec![
-                            Pos2::new(flat_x, trim_y_top),                               // top-left
-                            Pos2::new(flat_x, trim_y_top + trim_h),                      // bottom-left
-                            Pos2::new(flat_x + trim_handle_w, trim_y_top + trim_h * 0.5), // right point
+                            Pos2::new(flat_x, trim_y_top + trim_y_offset),                               // top-left
+                            Pos2::new(flat_x, trim_y_top + trim_y_offset + trim_h),                      // bottom-left
+                            Pos2::new(flat_x + trim_handle_w, trim_y_top + trim_y_offset + trim_h * 0.5), // right point
                         ],
                         COLOR_TRIM_HANDLE,
                         Stroke::new(1.0, Color32::WHITE),
@@ -1267,9 +1388,12 @@ impl FreetasiaApp {
                         let py = pos.y - origin.y;
                         // Generous vertical zone for the handle row — covers
                         // the ruler + some slack so you don't need pixel-perfect Y.
-                        let in_handle_y = py >= -4.0 && py <= ruler_h + 6.0;
+                        // Vertical zone covers the center handle (0..sq*2) and
+                        // the offset trim triangles (trim_y_offset..trim_y_offset+trim_h).
+                        let in_handle_y = py >= -4.0 && py <= ruler_h + 10.0;
 
-                        let sq_sec = sq as f64 / self.zoom as f64;
+                        // sq * 2.0 = half-width of the doubled center handle in pixels.
+                        let sq_sec = sq as f64 * 2.0 / self.zoom as f64;
                         let tw_sec = trim_handle_w as f64 / self.zoom as f64;
 
                         // Compute the visual center of each handle (in timeline seconds).
@@ -1281,25 +1405,30 @@ impl FreetasiaApp {
 
                         // Maximum grab radius — generous enough that the whole
                         // cluster of three handles is always reachable.
-                        let grab_radius = (sq + trim_handle_w + 10.0) as f64 / self.zoom as f64;
+                        let grab_radius = (sq * 2.0 + trim_handle_w + 10.0) as f64 / self.zoom as f64;
 
-                        // In the handle row, resolve by nearest-center distance
-                        // so you always get the closest handle, not a strict boundary.
+                        // In the handle row, the center handle has strict X priority:
+                        // any click within its half-width grabs the playhead regardless
+                        // of which side is clicked. Only outside that zone do we fall
+                        // back to nearest-center so the trim triangles are reachable.
                         let mut handle_hit = false;
                         if in_handle_y {
-                            let d_left = (t - left_center).abs();
-                            let d_right = (t - right_center).abs();
-                            let d_ph = (t - playhead_center).abs();
-                            let min_d = d_left.min(d_right).min(d_ph);
-
-                            if min_d <= grab_radius {
+                            if (t - playhead_center).abs() <= sq_sec {
+                                // Click is inside the center handle rectangle — always playhead.
                                 handle_hit = true;
-                                if min_d == d_left {
-                                    self.dragging_trim_left = true;
-                                } else if min_d == d_right {
-                                    self.dragging_trim_right = true;
-                                } else {
-                                    self.dragging_playhead = true;
+                                self.dragging_playhead = true;
+                            } else {
+                                let d_left = (t - left_center).abs();
+                                let d_right = (t - right_center).abs();
+                                let min_d = d_left.min(d_right);
+
+                                if min_d <= grab_radius {
+                                    handle_hit = true;
+                                    if d_left <= d_right {
+                                        self.dragging_trim_left = true;
+                                    } else {
+                                        self.dragging_trim_right = true;
+                                    }
                                 }
                             }
                         }
@@ -1991,6 +2120,8 @@ impl FreetasiaApp {
                 chrono::Local::now().format("%H:%M:%S")
             );
             let clip = Clip::new(0, session.video_path, dur, label);
+            let mut clip = clip;
+            clip.audio_path = session.audio_path;
             let id = self.project.timeline.add_clip(clip);
             self.selected_clip_id = Some(id);
             self.invalidate_resolution_cache();
@@ -2128,4 +2259,67 @@ fn ruler_step_secs(zoom: f32) -> f64 {
         }
     }
     600.0
+}
+
+/// Read a WAV file and return downsampled peak amplitudes at
+/// `WAVEFORM_PEAKS_PER_SEC` peaks per second of audio.
+fn load_waveform_peaks(path: &std::path::Path) -> anyhow::Result<Vec<f32>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let sample_rate = spec.sample_rate as f64;
+    let channels = spec.channels as usize;
+    // Use floating-point frames-per-peak so boundaries are computed exactly,
+    // eliminating accumulated drift (e.g. at 44100 Hz the integer truncation
+    // of 220.5 → 220 drifts ~1.4 s after a 10-minute recording).
+    let frames_per_peak = sample_rate / WAVEFORM_PEAKS_PER_SEC;
+
+    let mut peaks: Vec<f32> = Vec::new();
+    let mut window_max = 0.0_f32;
+    let mut frame: usize = 0;
+    let mut ch_pos: usize = 0;
+    let mut next_boundary = frames_per_peak;
+
+    macro_rules! push_sample {
+        ($s:expr) => {{
+            let s: f32 = $s;
+            if s > window_max { window_max = s; }
+            ch_pos += 1;
+            if ch_pos == channels {
+                ch_pos = 0;
+                frame += 1;
+                if frame as f64 >= next_boundary {
+                    peaks.push(window_max);
+                    window_max = 0.0;
+                    next_boundary += frames_per_peak;
+                }
+            }
+        }};
+    }
+
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                push_sample!(sample?.abs());
+            }
+        }
+        hound::SampleFormat::Int => {
+            let scale = (1i64 << (spec.bits_per_sample as u32 - 1)) as f32;
+            for sample in reader.samples::<i32>() {
+                push_sample!((sample? as f32 / scale).abs());
+            }
+        }
+    }
+    if window_max > 0.0 {
+        peaks.push(window_max);
+    }
+    // Normalise to [0, 1] so the waveform fills the track height regardless
+    // of recording volume. Without this, typical mic recordings (~0.05–0.15
+    // amplitude) produce ≤1 px bars that look completely flat.
+    let max_peak = peaks.iter().copied().fold(0.0f32, f32::max);
+    if max_peak > 0.0 {
+        for p in &mut peaks {
+            *p /= max_peak;
+        }
+    }
+    Ok(peaks)
 }

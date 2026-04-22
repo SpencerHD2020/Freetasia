@@ -40,10 +40,44 @@ fn build_ffmpeg_args(timeline: &Timeline, output_path: &Path) -> Result<(String,
 
     let mut args: Vec<String> = Vec::new();
 
-    // Input files: one per clip.
+    // Collect unique audio paths used by any clip, preserving insertion order.
+    // Map: audio_path → input index (video inputs are 0..n, audio starts at n).
+    let mut audio_input_index: std::collections::HashMap<std::path::PathBuf, usize> =
+        std::collections::HashMap::new();
+    let mut audio_inputs: Vec<std::path::PathBuf> = Vec::new();
+    for clip in clips {
+        let ap = clip.audio_path.as_ref()
+            .filter(|p| p.exists())
+            .or_else(|| {
+                // Fallback: same base name as video but with .wav extension.
+                None // avoid borrowing clip twice; handled below
+            })
+            .cloned();
+        // Also check the .wav-extension fallback.
+        let ap = ap.or_else(|| {
+            let p = clip.source_path.with_extension("wav");
+            if p.exists() { Some(p) } else { None }
+        });
+        if let Some(path) = ap {
+            if !audio_input_index.contains_key(&path) {
+                let idx = n + audio_inputs.len();
+                audio_input_index.insert(path.clone(), idx);
+                audio_inputs.push(path);
+            }
+        }
+    }
+    let has_audio = !audio_inputs.is_empty();
+
+    // Input files: one per video clip.
     for clip in clips {
         args.push("-i".into());
         args.push(clip.source_path.to_string_lossy().into_owned());
+    }
+
+    // Audio inputs (full files — trimming is done in filter_complex).
+    for ap in &audio_inputs {
+        args.push("-i".into());
+        args.push(ap.to_string_lossy().into_owned());
     }
 
     // Filter complex: trim each video stream, then concatenate.
@@ -60,6 +94,46 @@ fn build_ffmpeg_args(timeline: &Timeline, output_path: &Path) -> Result<(String,
         filter.push_str(&format!("[v{i}]"));
     }
     filter.push_str(&format!("concat=n={n}:v=1:a=0[concatv]"));
+
+    // Audio filter: atrim each clip's audio segment then concatenate.
+    // Clips with no audio get silence of the correct duration.
+    if has_audio {
+        let mut audio_segs_count = 0usize;
+        for (i, clip) in clips.iter().enumerate() {
+            let ap = clip.audio_path.as_ref()
+                .filter(|p| p.exists())
+                .cloned();
+            let ap = ap.or_else(|| {
+                let p = clip.source_path.with_extension("wav");
+                if p.exists() { Some(p) } else { None }
+            });
+            let audio_dur = (clip.trim_end - clip.trim_start).max(0.001);
+            if let Some(ref path) = ap {
+                if let Some(&ai) = audio_input_index.get(path) {
+                    filter.push_str(&format!(
+                        ";[{ai}:a]atrim=start={start}:end={end},asetpts=PTS-STARTPTS[a{i}]",
+                        start = clip.trim_start,
+                        end = clip.trim_end,
+                    ));
+                } else {
+                    filter.push_str(&format!(
+                        ";aevalsrc=exprs=0:c=stereo:r=44100:d={audio_dur}[a{i}]"
+                    ));
+                }
+            } else {
+                filter.push_str(&format!(
+                    ";aevalsrc=exprs=0:c=stereo:r=44100:d={audio_dur}[a{i}]"
+                ));
+            }
+            audio_segs_count += 1;
+        }
+        // Separate the per-segment filter chains from the concat node.
+        filter.push_str(";");
+        for i in 0..n {
+            filter.push_str(&format!("[a{i}]"));
+        }
+        filter.push_str(&format!("concat=n={audio_segs_count}:v=0:a=1[concata]"));
+    }
 
     // Apply overlays: text (drawtext), then blur (split+crop+boxblur+overlay).
     use super::overlay::OverlayKind;
@@ -143,16 +217,12 @@ fn build_ffmpeg_args(timeline: &Timeline, output_path: &Path) -> Result<(String,
     args.push("-map".into());
     args.push("[outv]".into());
 
-    // Optionally include audio from the first clip's paired WAV.
-    let audio_path = clips[0].source_path.with_extension("wav");
-    if audio_path.exists() {
-        args.push("-i".into());
-        args.push(audio_path.to_string_lossy().into_owned());
+    // Map the concatenated audio stream if any clips had audio.
+    if has_audio {
         args.push("-map".into());
-        args.push(format!("{}:a", n));
+        args.push("[concata]".into());
         args.push("-c:a".into());
         args.push("aac".into());
-        args.push("-shortest".into());
     }
 
     args.push("-c:v".into());
