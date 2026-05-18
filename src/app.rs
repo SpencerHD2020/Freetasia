@@ -226,7 +226,11 @@ impl FreetasiaApp {
                     self.open_project();
                 }
 
-                if ui.button("💾 Save").on_hover_text("Save project").clicked() {
+                if ui.button("� Import").on_hover_text("Import video file to timeline").clicked() {
+                    self.import_media_file();
+                }
+
+                if ui.button("�💾 Save").on_hover_text("Save project").clicked() {
                     self.save_project();
                 }
 
@@ -2128,6 +2132,65 @@ impl FreetasiaApp {
             self.request_scrub_frame();
             self.status(format!("Recording added to timeline ({:.1}s)", dur));
         }
+    }
+
+    fn import_media_file(&mut self) {
+        let paths = rfd::FileDialog::new()
+            .set_title("Import Media")
+            .add_filter("Video Files", &["mp4", "mkv", "avi", "mov", "webm"])
+            .add_filter("All files", &["*"])
+            .pick_files();
+
+        let Some(paths) = paths else {
+            return;
+        };
+
+        for path in paths {
+            let dur = match crate::editor::player::probe_video_duration(&path) {
+                Some(d) if d > 0.0 => d,
+                _ => {
+                    self.status(format!(
+                        "Import failed: could not read duration of {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    continue;
+                }
+            };
+
+            // Extract audio to WAV if the file contains an audio stream.
+            let audio_path = if crate::editor::player::probe_has_audio_stream(&path) {
+                match crate::editor::player::extract_audio_to_wav(&path) {
+                    Ok(wav) => Some(wav),
+                    Err(e) => {
+                        log::warn!("Audio extraction failed for {}: {e}", path.display());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let label = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+
+            let mut clip = Clip::new(0, path.clone(), dur, &label);
+            clip.audio_path = audio_path;
+            let id = self.project.timeline.add_clip(clip);
+            self.selected_clip_id = Some(id);
+
+            log::info!(
+                "Imported media: path={} duration={:.3}s",
+                path.display(),
+                dur
+            );
+        }
+
+        self.invalidate_resolution_cache();
+        self.request_scrub_frame();
+        self.status("Media imported to timeline");
     }
 
     fn save_project(&mut self) {

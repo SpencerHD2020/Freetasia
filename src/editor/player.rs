@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -794,6 +795,67 @@ pub fn probe_video_resolution(path: &std::path::Path) -> Option<(u32, u32)> {
     } else {
         None
     }
+}
+
+/// Check whether the media file contains at least one audio stream.
+pub fn probe_has_audio_stream(path: &std::path::Path) -> bool {
+    let Some(ffprobe_path) = find_ffprobe().ok() else {
+        return false;
+    };
+    let mut cmd = Command::new(&ffprobe_path);
+    cmd.args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_console_window(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().contains("audio")
+}
+
+/// Extract the audio stream from a media file to a WAV file using ffmpeg.
+///
+/// Returns `Ok(output_path)` on success, or an error if extraction fails.
+/// The output WAV is placed alongside the source with a `.wav` extension.
+pub fn extract_audio_to_wav(source: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let ffmpeg_path = find_ffmpeg()?;
+    let wav_path = source.with_extension("wav");
+
+    let mut cmd = Command::new(&ffmpeg_path);
+    cmd.args(["-y", "-i"])
+        .arg(source)
+        .args([
+            "-vn",
+            "-acodec",
+            "pcm_f32le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+        ])
+        .arg(&wav_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    hide_console_window(&mut cmd);
+
+    let output = cmd.output().context("Failed to run ffmpeg for audio extraction")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ffmpeg audio extraction failed: {}", stderr.lines().last().unwrap_or("unknown error"));
+    }
+
+    Ok(wav_path)
 }
 
 // ── Audio playback ──────────────────────────────────────────────────────────
